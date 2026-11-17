@@ -22,11 +22,16 @@ const powers = [
   { name: 'ONDA', detail: 'Empuja a todos los autos cercanos.', color: 0x42d07a, cd: 5 },
 ];
 const modifiers = [
-  { name: 'ACEITE', color: 0xc49bff, detail: 'Menos agarre. Más caos.' },
-  { name: 'CONO', color: 0xff9a2e, detail: 'Un obstáculo que te hace girar.' },
-  { name: 'TURBO', color: 0x42d07a, detail: 'Un acelerador para todos.' },
+  { name: 'ACEITE', color: 0xc49bff, detail: 'Pierdes agarre al pisarlo.', radius: 22 },
+  { name: 'CONO', color: 0xff9a2e, detail: 'Un golpe que te hace girar.', radius: 18 },
+  { name: 'TURBO', color: 0x42d07a, detail: 'Velocidad para quien lo pise.', radius: 22 },
+  { name: 'BARRERA', color: 0xef6866, detail: 'Un bloqueo de alto impacto.', radius: 25 },
+  { name: 'MINA FIJA', color: 0xf7d36b, detail: 'Explota y se recarga en 3 s.', radius: 20 },
+  { name: 'PINCHOS', color: 0xcbd4e4, detail: 'Te frenan durante 1.8 s.', radius: 21 },
+  { name: 'RAMPA', color: 0x42baf8, detail: 'Salta sobre autos y trampas.', radius: 22 },
+  { name: 'MARTILLO', color: 0xf08db9, detail: 'Golpea de forma intermitente.', radius: 25 },
 ];
-const tuning = { step: 1 / 120, laps: 2, wins: 5, raceSeconds: 65, road: 38, maxModifiers: 16 };
+const tuning = { step: 1 / 120, laps: 2, wins: 5, raceSeconds: 65, road: 38, gateSlack: 8, maxModifiers: 16 };
 const held = Object.create(null), pressed = Object.create(null), keyMap = Object.create(null);
 for (const [code, keys] of Object.entries(CABINET_KEYS)) for (const key of keys) keyMap[key.toLowerCase()] = code;
 window.addEventListener('keydown', event => {
@@ -48,8 +53,15 @@ function angleDelta(a, b) { return wrap(a - b + Math.PI, Math.PI * 2) - Math.PI;
 function hex(color) { return '#' + color.toString(16).padStart(6, '0'); }
 
 class Circuit {
-  constructor() {
-    const controls = [[190, 170], [420, 149], [660, 174], [704, 301], [636, 459], [443, 466], [333, 380], [149, 444], [88, 310]];
+  constructor(seed = 0) {
+    this.seed = seed >>> 0;
+    let state = this.seed || 1;
+    const random = () => { state ^= state << 13; state ^= state >>> 17; state ^= state << 5; return (state >>> 0) / 4294967296; };
+    const controls = this.seed ? Array.from({ length: 9 }, (_, i) => {
+      const angle = -2.37 + i * Math.PI * 2 / 9;
+      const radius = 0.91 + random() * 0.09;
+      return [400 + Math.cos(angle) * 298 * radius, 313 + Math.sin(angle) * 158 * radius];
+    }) : [[190, 170], [420, 149], [660, 174], [704, 301], [636, 459], [443, 466], [333, 380], [149, 444], [88, 310]];
     this.points = []; this.length = 0;
     for (let i = 0; i < controls.length; i++) for (let j = 0; j < 24; j++) {
       const t = j / 24, p = [];
@@ -87,19 +99,20 @@ class Circuit {
 }
 
 class Championship {
-  constructor(humans = 1) {
-    this.track = new Circuit(); this.humans = humans; this.round = 0;
+  constructor(humans = 1, seed = 0) {
+    this.track = new Circuit(seed); this.humans = humans; this.round = 0;
     this.modifiers = []; this.effects = []; this.shots = []; this.hazards = [];
     this.cars = palette.map((color, id) => ({ id, color, name: id < humans ? 'P' + (id + 1) : names[id] === 'P2' ? 'AZUL' : names[id], human: id < humans, wins: 0, levels: Array(6).fill(0), slots: [-1, -1], cooldowns: [0, 0] }));
     this.phase = 'title'; this.timer = 0; this.draft = 0; this.choice = 0; this.lane = 0; this.placeS = 0;
     this.beginRace();
   }
   beginRace() {
+    for (const modifier of this.modifiers) modifier.readyAt = 0;
     this.round++; this.phase = 'countdown'; this.timer = 2.5; this.elapsed = 0;
     this.shots.length = 0; this.hazards.length = 0; this.effects.length = 0; this.finishOrder = [];
     for (const c of this.cars) {
       const s = -24 - Math.floor(c.id / 2) * 30, p = this.track.at(s, c.id % 2 ? 15 : -15);
-      Object.assign(c, p, { vx: 0, vy: 0, speed: 0, lap: 0, gate: 0, started: false, progress: s, lastS: p.s, shield: 0, boost: 0, stun: 0, slick: 0, contact: 0, stuck: 0, bestProgress: s, finished: false, finishTime: 0, flash: 0 });
+      Object.assign(c, p, { vx: 0, vy: 0, speed: 0, lap: 0, gate: 0, gateTravel: 0, started: false, progress: s, lastS: p.s, shield: 0, boost: 0, stun: 0, slick: 0, air: 0, slow: 0, contact: 0, stuck: 0, bestProgress: s, finished: false, finishTime: 0, flash: 0 });
       c.cooldowns = [0, 0];
     }
   }
@@ -141,11 +154,11 @@ class Championship {
   order() { return this.cars.slice().sort((a, b) => a.finished !== b.finished ? (a.finished ? -1 : 1) : a.finished ? a.finishTime - b.finishTime : b.progress - a.progress || a.id - b.id); }
   finishRound() {
     this.standings = this.order(); this.winner = this.standings[0]; this.winner.wins++;
-    this.phase = this.winner.wins >= tuning.wins ? 'champion' : 'results'; this.timer = 0;
+    this.phase = this.winner.wins >= tuning.wins ? 'champion' : 'results'; this.timer = 0; this.endChoice = 0;
     this.burst(this.winner.x, this.winner.y, this.winner.color, 80);
   }
   workshop() {
-    this.phase = 'workshop'; this.timer = 18; this.choice = 0; this.placeS = this.track.length * 0.22; this.lane = 0;
+    this.phase = 'workshop'; this.workshopMode = 'choice'; this.timer = 18; this.choice = 0; this.placeS = this.track.length * 0.22; this.lane = 0;
   }
   canPlace(s, lane) {
     const p = this.track.at(s, lane), seam = Math.min(p.s, this.track.length - p.s);
@@ -159,13 +172,29 @@ class Championship {
   nextDraft() {
     this.draft++;
     if (this.draft >= this.drafters.length) { this.beginRace(); return; }
-    this.phase = 'draft'; this.timer = 15; this.choice = 0; this.draftSlot = 0;
+    this.phase = 'draft'; this.draftMode = 'power'; this.timer = 15; this.choice = 0; this.draftSlot = 0;
     const c = this.drafters[this.draft];
     const available = powers.findIndex((p, i) => c.levels[i] < 3);
     if (available < 0) { this.nextDraft(); return; }
     this.choice = available;
   }
   startDraft() { this.drafters = this.standings.slice(1); this.draft = -1; this.nextDraft(); }
+  applyModifier(car, modifier) {
+    const kind = modifier.kind;
+    if (car.air > 0 || Math.hypot(car.x - modifier.x, car.y - modifier.y) >= modifiers[kind].radius) return;
+    if (kind === 0) car.slick = 0.8;
+    if (kind === 1 || kind === 3) this.hit(car, car.x - modifier.x || 1, car.y - modifier.y, kind === 3 ? 165 : 100);
+    if (kind === 2) car.boost = 0.5;
+    if (kind === 4 && this.elapsed >= (modifier.readyAt || 0)) {
+      modifier.readyAt = this.elapsed + 3;
+      this.hit(car, car.x - modifier.x || 1, car.y - modifier.y, 175);
+      this.burst(modifier.x, modifier.y, modifiers[kind].color, 54);
+    }
+    if (kind === 5 && this.hit(car, 0, 0, 0)) car.slow = 1.8;
+    if (kind === 6) { car.air = 0.85; this.burst(car.x, car.y, modifiers[kind].color, 30); }
+    if (kind === 7 && this.hammerActive(modifier)) this.hit(car, car.x - modifier.x || 1, car.y - modifier.y, 190);
+  }
+  hammerActive(modifier) { return (this.elapsed + modifier.s / 100) % 3 < 0.9; }
   step(dt, demo = false) {
     for (const e of this.effects) e.life -= dt;
     this.effects = this.effects.filter(e => e.life > 0);
@@ -174,7 +203,7 @@ class Championship {
     this.elapsed += dt;
     for (const c of this.cars) {
       if (c.finished) continue;
-      for (const name of ['shield', 'boost', 'stun', 'slick', 'contact', 'flash']) c[name] = Math.max(0, c[name] - dt);
+      for (const name of ['shield', 'boost', 'stun', 'slick', 'air', 'slow', 'contact', 'flash']) c[name] = Math.max(0, c[name] - dt);
       c.cooldowns = c.cooldowns.map(v => Math.max(0, v - dt));
       let steering, brake;
       const p = this.track.project(c.x, c.y), oldS = c.lastS;
@@ -194,7 +223,7 @@ class Championship {
       const forward = c.vx * Math.cos(c.angle) + c.vy * Math.sin(c.angle);
       c.angle += steering * 3.25 * clamp(Math.abs(forward) / 65, 0.1, 1) * (forward < -3 ? -1 : 1) * (c.stun > 0 ? 0.2 : 1) * dt;
       const offroad = p.distance > tuning.road;
-      const speedLimit = (c.human && !demo ? 182 : 156 + c.id * 2) * (c.boost > 0 ? 1.5 : 1) * (offroad ? 0.42 : 1);
+      const speedLimit = (c.human && !demo ? 182 : 156 + c.id * 2) * (c.boost > 0 ? 1.5 : 1) * (offroad ? 0.42 : 1) * (c.slow > 0 ? 0.5 : 1);
       const targetSpeed = brake ? -55 : speedLimit;
       const motor = brake && forward > 0 ? 260 : 140;
       let nextSpeed = forward + clamp(targetSpeed - forward, -motor * dt, motor * dt);
@@ -209,30 +238,28 @@ class Championship {
       const ds = wrap(q.s - oldS + length / 2, length) - length / 2;
       c.lastS = q.s;
       if (q.distance < tuning.road + 5 && Math.abs(ds) < 15) {
-        c.progress += ds;
+        c.progress += ds; c.gateTravel += ds;
+        const completeSector = c.gateTravel >= length / 4 - tuning.gateSlack;
         if (ds > 0) {
-          if (c.gate === 0 && oldS > length * 0.9 && q.s < length * 0.1) {
+          if (c.gate === 0 && oldS > length * 0.9 && q.s < length * 0.1 && (!c.started || completeSector)) {
             if (c.started) c.lap++; else c.started = true;
-            c.gate = 1;
+            c.gate = 1; c.gateTravel = 0;
             if (c.lap >= tuning.laps) { c.finished = true; c.finishTime = this.elapsed; this.finishOrder.push(c.id); this.burst(c.x, c.y, c.color, 40); }
-          } else if (c.gate > 0 && oldS < length * c.gate / 4 && q.s >= length * c.gate / 4) c.gate = (c.gate + 1) % 4;
+          } else if (c.gate > 0 && completeSector && oldS < length * c.gate / 4 && q.s >= length * c.gate / 4) { c.gate = (c.gate + 1) % 4; c.gateTravel = 0; }
         }
       }
+      if (q.distance >= tuning.road + 5 || Math.abs(ds) >= 15) c.gateTravel = 0;
       if (c.progress > c.bestProgress + 12) { c.bestProgress = c.progress; c.stuck = 0; } else c.stuck += dt;
       if (c.stuck > 4) {
         const safe = this.track.at(c.lastS, (c.id % 2 ? 1 : -1) * 12);
         c.x = safe.x; c.y = safe.y; c.angle = safe.angle; c.vx = 0; c.vy = 0; c.stuck = 0;
         this.burst(c.x, c.y, 0xffffff, 20);
       }
-      for (const m of this.modifiers) if (Math.hypot(c.x - m.x, c.y - m.y) < (m.kind === 1 ? 18 : 22)) {
-        if (m.kind === 0) c.slick = 0.8;
-        if (m.kind === 1) this.hit(c, c.x - m.x || 1, c.y - m.y, 100);
-        if (m.kind === 2) c.boost = 0.5;
-      }
+      for (const modifier of this.modifiers) this.applyModifier(c, modifier);
     }
     for (let i = 0; i < 4; i++) for (let j = i + 1; j < 4; j++) {
       const a = this.cars[i], b = this.cars[j];
-      if (a.finished || b.finished) continue;
+      if (a.finished || b.finished || a.air > 0 || b.air > 0) continue;
       let x = b.x - a.x, y = b.y - a.y, distance = Math.hypot(x, y);
       if (distance < 21) {
         if (distance < 0.001) { x = 1; y = 0; distance = 1; }
@@ -246,7 +273,7 @@ class Championship {
     for (const shot of this.shots) {
       shot.life -= dt; const oldX = shot.x, oldY = shot.y;
       shot.x += shot.vx * dt; shot.y += shot.vy * dt;
-      for (const c of this.cars) if (c.id !== shot.owner && !c.finished) {
+      for (const c of this.cars) if (c.id !== shot.owner && !c.finished && c.air <= 0) {
         const dx = shot.x - oldX, dy = shot.y - oldY;
         const fraction = clamp(((c.x - oldX) * dx + (c.y - oldY) * dy) / (dx * dx + dy * dy || 1), 0, 1);
         if (Math.hypot(c.x - oldX - dx * fraction, c.y - oldY - dy * fraction) < 14) { this.hit(c, dx, dy, 140); shot.life = 0; break; }
@@ -256,7 +283,7 @@ class Championship {
     for (const hazard of this.hazards) {
       hazard.life -= dt; hazard.age += dt;
       if (hazard.age < 0.5) continue;
-      for (const c of this.cars) if (!c.finished && Math.hypot(c.x - hazard.x, c.y - hazard.y) < hazard.radius + 10) {
+      for (const c of this.cars) if (!c.finished && c.air <= 0 && Math.hypot(c.x - hazard.x, c.y - hazard.y) < hazard.radius + 10) {
         if (hazard.kind === 2) c.slick = 0.7;
         else { this.hit(c, c.x - hazard.x || 1, c.y - hazard.y, 160); hazard.life = 0; this.burst(hazard.x, hazard.y, 0xf7d36b, 48); break; }
       }
@@ -272,39 +299,79 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) { cle
 
 class CabinetScene extends Phaser.Scene {
   create() {
-    sceneRef = this; this.match = new Championship(); this.match.phase = 'title'; this.accumulator = 0; this.age = 0; this.labels = []; this.labelIndex = 0;
+    sceneRef = this; this.match = new Championship(); this.match.phase = 'title'; this.accumulator = 0; this.age = 0; this.titleRow = 2; this.titleHumans = 1; this.titleRandom = false; this.labels = []; this.labelIndex = 0;
     this.trackArt = this.add.graphics(); this.paintCircuit();
     this.ink = this.add.graphics(); this.overlay = this.add.graphics();
-    this.best = null; this.saveMessage = ''; this.savedMatch = null; this.storageWritable = false;
+    this.best = null; this.legacyBest = null; this.saveMessage = ''; this.savedMatch = null; this.storageWritable = false;
     this.recordReady = this.loadRecord();
   }
   async loadRecord() {
     try {
       if (!window.platanusArcadeStorage) { this.saveMessage = 'Récord disponible en la máquina arcade'; return; }
-      const record = await window.platanusArcadeStorage.get('nitro-nonsense:arcade:best');
-      if (!record.found) { this.storageWritable = true; return; }
-      if (!record.value || record.value.version !== 1 || !Number.isFinite(record.value.seconds) || record.value.seconds <= 0) {
-        this.storageWritable = false; this.saveMessage = 'Récord anterior conservado'; return;
+      const [legacy, current] = await Promise.all([
+        window.platanusArcadeStorage.get('nitro-nonsense:arcade:best'),
+        window.platanusArcadeStorage.get('nitro-nonsense:arcade:best-v2'),
+      ]);
+      if (legacy.found && legacy.value && legacy.value.version === 1 && Number.isFinite(legacy.value.seconds) && legacy.value.seconds > 0) this.legacyBest = legacy.value.seconds;
+      if (!current.found) { this.storageWritable = true; return; }
+      if (!current.value || current.value.version !== 2 || current.value.track !== 'original' || !Number.isFinite(current.value.seconds) || current.value.seconds <= 0) {
+        this.saveMessage = 'Récord anterior conservado'; return;
       }
-      this.best = record.value.seconds; this.storageWritable = true;
-    } catch { this.storageWritable = false; this.saveMessage = 'Sin guardado. Puedes jugar igual.'; }
+      this.best = current.value.seconds; this.storageWritable = true;
+    } catch { this.saveMessage = 'Sin guardado. Puedes jugar igual.'; }
   }
   async recordMatch() {
     const m = this.match;
     if (this.savedMatch === m || m.humans !== 1 || m.winner.id !== 0) return;
     this.savedMatch = m;
+    if (m.track.seed) { this.saveMessage = 'Pista aleatoria: tiempo sin récord comparable.'; return; }
     await this.recordReady;
     const seconds = m.totalSeconds;
     if (!this.storageWritable || !window.platanusArcadeStorage || this.best !== null && seconds >= this.best) return;
     try {
-      await window.platanusArcadeStorage.set('nitro-nonsense:arcade:best', { version: 1, seconds });
+      await window.platanusArcadeStorage.set('nitro-nonsense:arcade:best-v2', { version: 2, track: 'original', seconds });
       this.best = seconds; this.saveMessage = '¡Nuevo récord guardado!';
     } catch { this.saveMessage = 'No se pudo guardar. Tu victoria cuenta.'; }
   }
-  pauseGame() {
+  menuOwner() {
     const m = this.match;
-    if (!m || m.phase === 'title' || m.phase === 'paused' || m.phase === 'champion') return;
-    this.previousPhase = m.phase; m.phase = 'paused'; this.accumulator = 0;
+    if (m.phase === 'paused') return this.pauseOwner;
+    if (m.phase === 'draft') return m.drafters[m.draft].human ? m.drafters[m.draft].id : -1;
+    if (m.phase === 'workshop') return m.winner.human ? m.winner.id : -1;
+    if (m.phase === 'results' || m.phase === 'champion') return m.winner.human ? m.winner.id : 0;
+    return 0;
+  }
+  confirm(owner) { return owner >= 0 && (tap('P' + (owner + 1) + '_1') || tap('START' + (owner + 1))); }
+  menuMove(owner) {
+    if (owner < 0) return { x: 0, y: 0 };
+    const m = this.match, prefix = 'P' + (owner + 1) + '_';
+    const context = [m.phase, owner, m.workshopMode, m.draftMode, m.draft, m.round].join(':');
+    if (context !== this.navContext) { this.navContext = context; this.navDirection = ''; this.navNext = 0; }
+    const x = Number(tap(prefix + 'R')) - Number(tap(prefix + 'L')) || Number(!!held[prefix + 'R']) - Number(!!held[prefix + 'L']);
+    const y = Number(tap(prefix + 'D')) - Number(tap(prefix + 'U')) || Number(!!held[prefix + 'D']) - Number(!!held[prefix + 'U']);
+    if (!x && !y) { this.navDirection = ''; return { x: 0, y: 0 }; }
+    const direction = x + ',' + y, changed = direction !== this.navDirection;
+    if (!changed && this.age < this.navNext) return { x: 0, y: 0 };
+    this.navDirection = direction; this.navNext = this.age + (changed ? 0.32 : 0.14);
+    return y ? { x: 0, y } : { x, y: 0 };
+  }
+  menuHint(owner, action = 'confirmar', back = false) {
+    return owner < 0 ? 'Turno del bot · espera' : owner === 0 ? 'P1: W/A/S/D mover · U ' + action + (back ? ' · I volver' : '') : 'P2: flechas mover · R ' + action + (back ? ' · T volver' : '');
+  }
+  startMatch(humans, randomTrack) {
+    const seed = randomTrack ? (Math.floor(Math.random() * 4294967295) + 1) >>> 0 || 1 : 0;
+    this.match = new Championship(humans, seed); this.match.totalSeconds = 0;
+    this.paintCircuit(); clearInput(); this.accumulator = 0;
+  }
+  showTitle() {
+    this.match = new Championship(); this.match.phase = 'title'; this.titleRow = 2;
+    this.paintCircuit(); clearInput(); this.accumulator = 0;
+  }
+  pauseGame(owner = this.menuOwner()) {
+    const m = this.match;
+    if (!m || ['title', 'paused', 'champion'].includes(m.phase)) return;
+    this.pauseOwner = Math.max(0, owner); this.previousPhase = m.phase;
+    m.phase = 'paused'; this.accumulator = 0; clearInput();
   }
   text(value, x, y, size = 16, color = 0xf2f5fb, center = false, display = false) {
     let label = this.labels[this.labelIndex++];
@@ -357,8 +424,10 @@ class CabinetScene extends Phaser.Scene {
   }
   car(c, scale = 1) {
     const g = this.ink, a = c.angle, sx = Math.cos(a), sy = Math.sin(a);
+    const lift = c.air > 0 ? Math.sin(c.air / 0.85 * Math.PI) * 16 : 0;
+    if (lift > 0) g.fillStyle(0x030608, 0.7).fillEllipse(c.x + 3, c.y + 3, 27, 15);
     const poly = (points, color, offset = 0) => {
-      g.fillStyle(color).fillPoints(points.map(([x, y]) => ({ x: c.x + (x * sx - y * sy) * scale + offset, y: c.y + (x * sy + y * sx) * scale + offset })), true);
+      g.fillStyle(color).fillPoints(points.map(([x, y]) => ({ x: c.x + (x * sx - y * sy) * scale + offset, y: c.y - lift + (x * sy + y * sx) * scale + offset })), true);
     };
     if (c.boost > 0) poly([[-13, -6], [-24 - Math.sin(this.age * 40) * 5, 0], [-13, 6]], 0xffbc66);
     poly([[-16, -9], [12, -9], [17, -5], [17, 5], [12, 9], [-16, 9]], 0x060a11, 3);
@@ -373,7 +442,7 @@ class CabinetScene extends Phaser.Scene {
   drawWorld() {
     const m = this.match, g = this.ink;
     g.clear(); this.overlay.clear(); this.labelIndex = 0;
-    for (const h of m.modifiers) this.modifier(h.x, h.y, h.kind);
+    for (const h of m.modifiers) this.modifier(h.x, h.y, h.kind, true, h);
     for (const h of m.hazards) {
       if (h.kind === 2) { g.fillStyle(0x10101c, 0.9).fillEllipse(h.x, h.y, h.radius * 2, h.radius * 1.5); g.lineStyle(2, 0x9574bd).strokeEllipse(h.x, h.y, h.radius * 1.6, h.radius); }
       else { g.fillStyle(0xf7d36b).fillCircle(h.x, h.y, 7); g.fillStyle(h.age > 0.5 && this.age % 0.3 < 0.15 ? 0xef4b4c : 0x3c3232).fillCircle(h.x, h.y, 3); }
@@ -381,16 +450,42 @@ class CabinetScene extends Phaser.Scene {
     for (const c of m.cars) {
       if (c.slick > 0 && c.speed > 40) { g.lineStyle(3, 0x11141c, 0.7).lineBetween(c.x - c.vx * 0.15, c.y - c.vy * 0.15, c.x, c.y); }
       this.car(c);
-      if (c.human && ['race', 'countdown', 'workshop'].includes(m.phase)) this.text(c.name, c.x, c.y - 25, 13, c.color, true);
+      if (c.human && (['race', 'countdown'].includes(m.phase) || m.phase === 'workshop' && (m.workshopMode === 'placement' || !m.winner.human))) this.text(c.name, c.x, c.y - 25, 13, c.color, true);
     }
     for (const s of m.shots) { g.lineStyle(4, 0xffdd8d).lineBetween(s.x, s.y, s.x - s.vx * 0.018, s.y - s.vy * 0.018); }
     for (const e of m.effects) g.lineStyle(3, e.color, e.life / 0.55).strokeCircle(e.x, e.y, e.radius * (1 - e.life / 0.55) + 3);
   }
-  modifier(x, y, kind, valid = true) {
-    const g = this.ink;
+  modifier(x, y, kind, valid = true, state = null, g = this.ink) {
     if (kind === 0) { g.fillStyle(0x151322).fillEllipse(x, y, 38, 28); g.lineStyle(2, 0xc49bff).strokeEllipse(x, y, 30, 18); }
     if (kind === 1) { g.fillStyle(0x161b28).fillRoundedRect(x - 13, y - 5, 26, 18, 3); g.fillStyle(0xff9a2e).fillTriangle(x, y - 16, x - 10, y + 8, x + 10, y + 8); g.lineStyle(4, 0xf7ecd3).lineBetween(x - 5, y - 3, x + 5, y - 3); }
     if (kind === 2) { g.fillStyle(0x163f35).fillRoundedRect(x - 16, y - 14, 32, 28, 3); g.lineStyle(3, 0x42d07a); for (let i = -7; i < 10; i += 9) g.lineBetween(x + i - 4, y - 7, x + i + 3, y).lineBetween(x + i + 3, y, x + i - 4, y + 7); }
+    if (kind === 3) {
+      g.fillStyle(0x181c28).fillRoundedRect(x - 22, y - 12, 44, 27, 3);
+      g.fillStyle(0xcbd4e4).fillRoundedRect(x - 21, y - 13, 42, 20, 3);
+      for (let i = -17; i < 20; i += 14) g.fillStyle(0xef6866).fillRect(x + i, y - 13, 7, 20);
+    }
+    if (kind === 4) {
+      const ready = !state || this.match.elapsed >= (state.readyAt || 0);
+      g.fillStyle(0x101520).fillCircle(x, y, 16);
+      g.lineStyle(3, ready ? 0xf7d36b : 0x4a5570).strokeCircle(x, y, 13);
+      g.fillStyle(ready ? 0xef4b4c : 0x4a5570).fillCircle(x, y, 5);
+    }
+    if (kind === 5) {
+      g.fillStyle(0x171d28).fillRect(x - 20, y - 10, 40, 20);
+      for (let i = -15; i < 20; i += 10) g.fillStyle(0xcbd4e4).fillTriangle(x + i - 4, y + 6, x + i, y - 9, x + i + 4, y + 6);
+    }
+    if (kind === 6) {
+      g.fillStyle(0x18405c).fillRect(x - 20, y - 12, 40, 28);
+      for (let i = -12; i < 18; i += 10) g.lineStyle(3, 0x42baf8).lineBetween(x - 14, y + i * 0.6, x + 14, y + i * 0.6 - 6);
+      g.lineStyle(4, 0x98ddff).lineBetween(x - 20, y - 12, x + 20, y - 12);
+    }
+    if (kind === 7) {
+      const active = !state || this.match.hammerActive(state);
+      g.fillStyle(0x2b334a).fillCircle(x, y, 22);
+      g.lineStyle(7, 0x8c98af).lineBetween(x - 18, y + 14, x + 9, y - (active ? 0 : 16));
+      g.fillStyle(active ? 0xf08db9 : 0x6f7a90).fillRoundedRect(x - 9, y - (active ? 9 : 25), 30, 18, 3);
+      if (active) g.lineStyle(2, 0xf08db9).strokeCircle(x, y, 25);
+    }
     if (!valid) g.lineStyle(3, 0xef4b4c).lineBetween(x - 16, y - 16, x + 16, y + 16);
   }
   hud() {
@@ -402,7 +497,7 @@ class CabinetScene extends Phaser.Scene {
       this.text(c.finished ? 'META' : 'VUELTA ' + Math.min(tuning.laps, c.lap + 1) + ' / ' + tuning.laps, x, 72, 13, 0xcbd4e4);
     }
     if (m.phase === 'race') {
-    this.text('RONDA ' + m.round, 440, 264, 15, 0x8c98af, true);
+    this.text('RONDA ' + m.round + (m.track.seed ? ' · PISTA ' + m.track.seed.toString(16).slice(-4).toUpperCase() : ''), 440, 264, 15, 0x8c98af, true);
     this.text('NITRO', 440, 296, 34, 0xff9a2e, true, true);
     this.text('NONSENSE', 440, 329, 24, 0xf2f5fb, true, true);
     const remaining = Math.max(0, tuning.raceSeconds - m.elapsed);
@@ -420,7 +515,8 @@ class CabinetScene extends Phaser.Scene {
       }
     }
     if (m.humans === 1) this.text('LOS PERDEDORES GANAN PODERES', 420, 550, 14, 0x8c98af);
-    this.text('← → girar   ↓ frenar / reversa   1 / 2 poderes   START pausa', 400, 586, 14, 0xcbd4e4, true);
+    this.text('P1: A/D girar · S frenar · U/I poderes', 24, 586, 14, palette[0]);
+    this.text(m.humans > 1 ? 'P2: ←/→ girar · ↓ frenar · R/T poderes' : 'Acelera solo · ENTER / START pausa', 418, 586, 14, m.humans > 1 ? palette[1] : 0xcbd4e4);
   }
   dim(alpha = 0.93) { this.overlay.fillStyle(0x0e1018, alpha).fillRect(0, 0, 800, 600); }
   key(label, x, y, width = 310, accent = true) {
@@ -429,20 +525,28 @@ class CabinetScene extends Phaser.Scene {
   }
   title() {
     this.overlay.fillStyle(0x0e1018, 0.88).fillRect(0, 0, 800, 600);
-    this.overlay.fillStyle(0xff9a2e).fillRect(35, 39, 6, 20);
-    this.text('PLATANUS HACK 26  /  SANTIAGO', 55, 49, 15, 0xcbd4e4);
-    this.text('NITRO', 55, 139, 82, 0xff9a2e, false, true);
-    this.text('NONSENSE', 55, 217, 66, 0xf2f5fb, false, true);
-    this.text('EL GANADOR CAMBIA LA PISTA.', 57, 286, 22, 0xf2f5fb);
-    this.text('LOS DEMÁS SE VUELVEN MÁS PELIGROSOS.', 57, 317, 18, 0xcbd4e4);
-    this.key('START 1   ·   JUGAR SOLO', 55, 365, 336);
-    this.key('START 2   ·   DOS JUGADORES', 408, 365, 336, false);
-    this.text('4 AUTOS', 57, 457, 20, 0xff9a2e, false, true);
-    this.text('2 VUELTAS', 280, 457, 20, 0xff9a2e, false, true);
-    this.text('5 VICTORIAS', 533, 457, 20, 0xff9a2e, false, true);
-    this.text('Aceleración automática  ·  ← → girar  ·  ↓ frenar / reversa', 400, 503, 17, 0xf2f5fb, true);
-    this.text('Teclado: P1 A/D/S + U/I     P2 flechas + R/T     Enter / 2 iniciar', 400, 541, 14, 0x8c98af, true);
-    this.text(this.best !== null ? 'MEJOR CAMPEONATO SOLO  ' + this.best.toFixed(1) + ' s' : 'CARRERAS CORTAS. RENCOR PARA RATO.', 400, 577, 13, 0xcbd4e4, true);
+    this.overlay.fillStyle(0xff9a2e).fillRect(35, 29, 6, 20);
+    this.text('PLATANUS HACK 26  /  SANTIAGO', 55, 39, 15, 0xcbd4e4);
+    this.text('NITRO', 55, 112, 76, 0xff9a2e, false, true);
+    this.text('NONSENSE', 55, 188, 62, 0xf2f5fb, false, true);
+    this.text('Gana. Cambia la pista. Pierde. Gana poderes.', 57, 249, 20, 0xf2f5fb);
+    for (let row = 0; row < 3; row++) {
+      const y = 282 + row * 63, focused = this.titleRow === row;
+      this.plate(55, y, 690, 49, focused ? row === 2 ? 0xff9a2e : 0x3c4661 : 0x1a1f2e, focused ? 0x42baf8 : 0x4a5570);
+      if (row === 2) this.text('JUGAR', 400, y + 25, 22, focused ? 0x0e1018 : 0xf2f5fb, true);
+      else {
+        this.text(row === 0 ? 'JUGADORES' : 'PISTA', 79, y + 25, 17, 0xcbd4e4);
+        this.text('◀  ' + (row === 0 ? this.titleHumans + (this.titleHumans === 1 ? ' JUGADOR' : ' JUGADORES') : this.titleRandom ? 'ALEATORIA' : 'ORIGINAL') + '  ▶', 566, y + 25, 18, focused ? 0xffbc66 : 0xf2f5fb, true);
+      }
+    }
+    this.text('P1: W/S elegir · A/D ajustar · U o ENTER confirmar', 400, 484, 16, palette[0], true);
+    this.text('P1: A/D girar · S frenar · U/I poderes', 400, 514, 17, palette[0], true);
+    this.text('P2: ←/→ girar · ↓ frenar · R/T poderes', 400, 540, 17, palette[1], true);
+    this.text('Se acelera solo. Ganas poderes al perder. Primero en ganar 5.', 400, 565, 15, 0xcbd4e4, true);
+    const records = [];
+    if (this.best !== null) records.push('ORIGINAL ' + this.best.toFixed(1) + ' s');
+    if (this.legacyBest !== null) records.push('LEGADO ' + this.legacyBest.toFixed(1) + ' s');
+    this.text(records.length ? 'RÉCORDS: ' + records.join(' · ') : '8 PIEZAS DE PISTA · 6 PODERES · 2 VUELTAS', 400, 588, 13, 0x8c98af, true);
   }
   results(champion = false) {
     const m = this.match;
@@ -457,93 +561,142 @@ class CabinetScene extends Phaser.Scene {
       this.text(c.name, 200, y + 26, 22, c.color);
       this.text(c.wins + ' / ' + tuning.wins + ' victorias', 445, y + 26, 18);
     }
-    this.text(champion ? 'Una pista cada vez más tuya. Una revancha pendiente.' : m.winner.name + ' modifica la pista. Los demás mejoran un poder.', 400, 449, 17, 0xcbd4e4, true);
-    this.key(champion ? '1   REVANCHA' : '1 / START   CONTINUAR', 225, 480, 350);
-    this.text(champion ? '2  VOLVER AL INICIO' : 'Continuación automática en ' + Math.max(0, Math.ceil(7 - m.timer)) + ' s', 400, 557, 15, 0x8c98af, true);
-    if (champion) this.text(this.saveMessage, 400, 585, 13, 0xcbd4e4, true);
+    const owner = this.menuOwner();
+    if (champion) {
+      this.key('REVANCHA', 225, 451, 350, m.endChoice === 0);
+      this.key('VOLVER AL INICIO', 225, 511, 350, m.endChoice === 1);
+    } else {
+      this.text(m.winner.name + ' modifica la pista. Los demás mejoran un poder.', 400, 449, 17, 0xcbd4e4, true);
+      this.key('CONTINUAR', 225, 480, 350);
+    }
+    this.text(this.menuHint(owner), 400, champion ? 573 : 557, 15, palette[owner], true);
+    if (champion && this.saveMessage) this.text(this.saveMessage, 400, 590, 12, 0xcbd4e4, true);
   }
   workshopScreen() {
-    const m = this.match, p = m.track.at(m.placeS, m.lane), valid = m.canPlace(m.placeS, m.lane);
+    const m = this.match, owner = this.menuOwner();
+    if (m.workshopMode === 'choice' && owner >= 0) {
+      this.dim(0.96);
+      this.text(m.winner.name + ' · ELIGE QUÉ AGREGAR', 400, 47, 27, m.winner.color, true, true);
+      this.text('La pista y sus piezas permanecen durante todo el campeonato.', 400, 90, 16, 0xcbd4e4, true);
+      for (let i = 0; i <= modifiers.length; i++) {
+        const x = 39 + i % 3 * 244, y = 131 + Math.floor(i / 3) * 129, selected = m.choice === i;
+        const item = modifiers[i] || { name: 'OMITIR', detail: 'Seguir sin agregar una pieza.', color: 0xcbd4e4 };
+        this.plate(x, y, 232, 114, selected ? 0x3c4661 : 0x1a1f2e, selected ? 0x42baf8 : 0x4a5570);
+        if (i < modifiers.length) this.modifier(x + 200, y + 32, i, true, null, this.overlay);
+        this.text(item.name, x + 15, y + 31, 20, item.color, false, true);
+        this.text(item.detail, x + 15, y + 76, 14, 0xcbd4e4);
+      }
+      this.text(this.menuHint(owner, 'elegir'), 400, 555, 16, m.winner.color, true);
+      this.text(m.modifiers.length + ' / ' + tuning.maxModifiers + ' piezas colocadas · Puedes elegir OMITIR', 400, 585, 14, 0x8c98af, true);
+      return;
+    }
+    const p = m.track.at(m.placeS, m.lane), valid = m.canPlace(m.placeS, m.lane);
     this.overlay.fillStyle(0x0e1018).fillRect(0, 0, 800, 100).fillRect(0, 526, 800, 74);
-    this.text(m.winner.name + '  ·  TU PISTA, TUS REGLAS', 24, 31, 22, m.winner.color);
-    this.text('← → recorrer pista   ↑ ↓ elegir carril   1 colocar   2 cambiar pieza', 24, 68, 16, 0xf2f5fb);
-    this.text(Math.ceil(m.timer) + ' s', 724, 34, 20, 0xcbd4e4);
+    this.text(m.winner.name + ' · ' + (owner < 0 ? 'ESTÁ EDITANDO' : 'UBICA ' + modifiers[m.choice].name), 24, 31, 23, m.winner.color);
+    this.text(owner === 0 ? 'A/D recorrer pista · W/S cambiar carril · U colocar · I volver' : owner === 1 ? '←/→ recorrer pista · ↑/↓ cambiar carril · R colocar · T volver' : 'Espera a que el bot coloque su pieza.', 24, 70, 16, 0xf2f5fb);
     this.modifier(p.x, p.y, m.choice, valid);
     this.ink.lineStyle(3, valid ? 0x42baf8 : 0xef4b4c).strokeCircle(p.x, p.y, 28 + Math.sin(this.age * 5) * 2);
     this.plate(257, 246, 286, 123, 0x1a1f2e);
     this.text(modifiers[m.choice].name, 400, 275, 23, modifiers[m.choice].color, true, true);
     this.text(modifiers[m.choice].detail, 400, 309, 15, 0xcbd4e4, true);
     this.text('Queda para las próximas carreras.', 400, 341, 14, 0xcbd4e4, true);
-    this.text(valid ? '1  COLOCAR  ·  START  OMITIR' : 'Busca otro lugar  ·  START omitir', 400, 553, 19, valid ? 0xf2f5fb : 0xef6866, true);
+    this.text(valid ? this.menuHint(owner, 'colocar', true) : m.modifiers.length >= tuning.maxModifiers ? 'Pista llena. Vuelve y elige OMITIR.' : 'Busca un lugar libre, lejos de la salida.', 400, 553, 17, valid ? 0xf2f5fb : 0xef6866, true);
     this.text('Fuera de la salida y separada de otras piezas. ' + m.modifiers.length + ' / ' + tuning.maxModifiers, 400, 585, 14, 0x8c98af, true);
   }
   draftScreen() {
-    const m = this.match, c = m.drafters[m.draft];
+    const m = this.match, c = m.drafters[m.draft], choosingSlot = m.draftMode === 'slot';
     this.dim(0.96);
     this.text('PERDER TIENE SUS VENTAJAS', 400, 49, 29, 0xff9a2e, true, true);
-    this.text(c.name + '  ·  ELIGE UNA MEJORA', 400, 91, 22, c.color, true);
-    this.text('↑ ↓ fila   ← → columna   1 elegir   2 cambiar ranura', 400, 126, 16, 0xcbd4e4, true);
+    this.text(c.name + ' · ' + (choosingSlot ? 'ELIGE QUÉ RANURA REEMPLAZAR' : 'ELIGE UNA MEJORA'), 400, 91, 21, c.color, true);
+    this.text(choosingSlot ? 'Izquierda / derecha elegir ranura · botón 1 confirmar · botón 2 volver' : 'Direcciones para elegir un poder · botón 1 confirmar', 400, 126, 16, 0xcbd4e4, true);
     for (let i = 0; i < 6; i++) {
       const p = powers[i], x = 39 + (i % 3) * 244, y = 158 + Math.floor(i / 3) * 123, selected = m.choice === i;
-      this.plate(x, y, 232, 109, selected ? 0x3c4661 : 0x1a1f2e, selected ? 0x42baf8 : 0x4a5570);
+      this.plate(x, y, 232, 109, selected ? 0x3c4661 : 0x1a1f2e, selected && !choosingSlot ? 0x42baf8 : 0x4a5570);
       this.text(p.name, x + 17, y + 26, 21, p.color, false, true);
       this.text(c.levels[i] >= 3 ? 'NIVEL MÁXIMO' : 'NIVEL ' + c.levels[i] + ' → ' + (c.levels[i] + 1), x + 17, y + 60, 14, 0xcbd4e4);
       for (let level = 0; level < 3; level++) this.overlay.fillStyle(level < c.levels[i] ? p.color : 0x4a5570).fillRect(x + 17 + level * 62, y + 86, 53, 5);
     }
-    this.text(powers[m.choice].detail, 400, 432, 18, 0xf2f5fb, true);
-    const slot = m.draftSlot;
-    this.text('SI LAS DOS ESTÁN LLENAS, REEMPLAZA LA RANURA ' + (slot + 1), 400, 470, 14, 0x8c98af, true);
+    this.text(!choosingSlot && c.levels[m.choice] >= 3 ? 'Nivel máximo. Elige otro poder.' : powers[m.choice].detail, 400, 432, 18, 0xf2f5fb, true);
+    this.text(choosingSlot ? 'Solo se reemplaza la ranura elegida.' : 'Conservas las mejoras y los poderes de las otras ranuras.', 400, 470, 15, 0x8c98af, true);
     for (let i = 0; i < 2; i++) {
-      this.plate(153 + i * 250, 496, 242, 46, i === slot ? 0x3c4661 : 0x1a1f2e, i === slot ? 0x42baf8 : 0x4a5570);
+      const selected = choosingSlot && i === m.draftSlot;
+      this.plate(153 + i * 250, 496, 242, 46, selected ? 0x3c4661 : 0x1a1f2e, selected ? 0x42baf8 : 0x4a5570);
       this.text((i + 1) + '  ' + (c.slots[i] < 0 ? 'VACÍO' : powers[c.slots[i]].name), 274 + i * 250, 519, 18, 0xf2f5fb, true);
     }
-    this.text('Mejora automática en ' + Math.ceil(m.timer) + ' s · Las mejoras anteriores se conservan.', 400, 578, 14, 0xcbd4e4, true);
+    this.text(this.menuHint(this.menuOwner(), 'elegir', choosingSlot), 400, 578, 15, c.color, true);
   }
   menuInput(dt) {
-    const m = this.match;
+    const m = this.match, owner = this.menuOwner(), move = this.menuMove(owner);
     if (m.phase === 'title') {
-      const solo = tap('START1') || tap('P1_1'), duo = tap('START2') || tap('P2_1');
-      if (solo || duo) { this.match = new Championship(duo ? 2 : 1); this.match.totalSeconds = 0; clearInput(); this.accumulator = 0; }
+      if (move.y) this.titleRow = wrap(this.titleRow + move.y, 3);
+      if (move.x && this.titleRow === 0) this.titleHumans = this.titleHumans === 1 ? 2 : 1;
+      if (move.x && this.titleRow === 1) this.titleRandom = !this.titleRandom;
+      if (this.confirm(owner)) {
+        if (this.titleRow === 2) this.startMatch(this.titleHumans, this.titleRandom);
+        else this.titleRow++;
+      }
     } else if (m.phase === 'paused') {
-      if (tap('START1') || tap('START2') || tap('P1_1') || tap('P2_1')) { m.phase = this.previousPhase; clearInput(); this.accumulator = 0; }
-    } else if (m.phase === 'race') {
-      if (tap('START1') || m.humans > 1 && tap('START2')) { this.pauseGame(); return; }
-      for (let id = 0; id < m.humans; id++) for (let slot = 0; slot < 2; slot++) if (tap('P' + (id + 1) + '_' + (slot + 1))) m.fire(m.cars[id], slot);
+      if (this.confirm(owner)) { m.phase = this.previousPhase; clearInput(); this.accumulator = 0; }
+    } else if (m.phase === 'race' || m.phase === 'countdown') {
+      if (tap('START1')) { this.pauseGame(0); return; }
+      if (m.humans > 1 && tap('START2')) { this.pauseGame(1); return; }
+      if (m.phase === 'race') for (let id = 0; id < m.humans; id++) for (let slot = 0; slot < 2; slot++) if (tap('P' + (id + 1) + '_' + (slot + 1))) m.fire(m.cars[id], slot);
     } else if (m.phase === 'results') {
       m.timer += dt;
-      if (m.timer > 0.8 && (tap('P1_1') || tap('P2_1') || tap('START1') || tap('START2') || m.timer > 7)) { m.workshop(); clearInput(); }
+      if (m.timer > 0.6 && this.confirm(owner)) { m.workshop(); clearInput(); }
     } else if (m.phase === 'workshop') {
-      m.timer -= dt;
-      if (!m.winner.human) {
+      if (owner < 0) {
+        m.timer -= dt;
         if (m.timer < 16.5) {
-          m.choice = (m.round + m.winner.id) % 3;
+          m.choice = (m.round + m.winner.id) % modifiers.length;
           for (let i = 0; i < 24; i++) { m.placeS = m.track.length * wrap(m.round * 0.137 + i * 0.07, 1); m.lane = (i % 3 - 1) * 22; if (m.place()) break; }
           m.startDraft(); clearInput();
         }
+      } else if (m.workshopMode === 'choice') {
+        if (move.x) m.choice = Math.floor(m.choice / 3) * 3 + wrap(m.choice + move.x, 3);
+        if (move.y) m.choice = wrap(m.choice + move.y * 3, modifiers.length + 1);
+        if (this.confirm(owner)) {
+          if (m.choice === modifiers.length) m.startDraft();
+          else m.workshopMode = 'placement';
+          clearInput();
+        }
       } else {
-        const p = 'P' + (m.winner.id + 1) + '_';
-        m.placeS = wrap(m.placeS + (Number(!!held[p + 'R']) - Number(!!held[p + 'L'])) * 220 * dt, m.track.length);
-        if (tap(p + 'U')) m.lane = clamp(m.lane - 22, -22, 22);
-        if (tap(p + 'D')) m.lane = clamp(m.lane + 22, -22, 22);
-        if (tap(p + '2')) m.choice = (m.choice + 1) % 3;
-        if (tap(p + '1') && m.place() || tap('START' + (m.winner.id + 1)) || m.timer <= 0) { m.startDraft(); clearInput(); }
+        const prefix = 'P' + (owner + 1) + '_';
+        m.placeS = wrap(m.placeS + (Number(!!held[prefix + 'R']) - Number(!!held[prefix + 'L'])) * 220 * dt, m.track.length);
+        if (move.y) m.lane = clamp(m.lane + move.y * 22, -22, 22);
+        if (tap(prefix + '2')) { m.workshopMode = 'choice'; clearInput(); }
+        else if (this.confirm(owner) && m.place()) { m.startDraft(); clearInput(); }
       }
     } else if (m.phase === 'draft') {
-      m.timer -= dt;
-      const c = m.drafters[m.draft], p = 'P' + (c.id + 1) + '_';
-      if (c.human) {
-        if (tap(p + 'L')) m.choice = Math.floor(m.choice / 3) * 3 + wrap(m.choice - 1, 3);
-        if (tap(p + 'R')) m.choice = Math.floor(m.choice / 3) * 3 + (m.choice + 1) % 3;
-        if (tap(p + 'U') || tap(p + 'D')) m.choice = (m.choice + 3) % 6;
-        if (tap(p + '2')) m.draftSlot = 1 - m.draftSlot;
-      } else if (m.timer < 14) m.choice = (m.round + c.id * 2) % 6;
-      const automatic = c.human ? m.timer <= 0 : m.timer < 14;
-      if (automatic && c.levels[m.choice] >= 3) m.choice = powers.findIndex((p, i) => c.levels[i] < 3);
-      if ((automatic || c.human && tap(p + '1')) && m.upgrade(c, m.choice)) { m.nextDraft(); clearInput(); }
+      const c = m.drafters[m.draft];
+      if (owner < 0) {
+        m.timer -= dt;
+        if (m.timer < 14) {
+          m.choice = (m.round + c.id * 2) % powers.length;
+          if (c.levels[m.choice] >= 3) m.choice = powers.findIndex((p, i) => c.levels[i] < 3);
+          m.draftSlot = m.round % 2;
+          if (m.upgrade(c, m.choice)) { m.nextDraft(); clearInput(); }
+        }
+      } else if (m.draftMode === 'slot') {
+        if (move.x) m.draftSlot = 1 - m.draftSlot;
+        if (tap('P' + (owner + 1) + '_2')) { m.draftMode = 'power'; clearInput(); }
+        else if (this.confirm(owner) && m.upgrade(c, m.choice)) { m.nextDraft(); clearInput(); }
+      } else {
+        if (move.x) m.choice = Math.floor(m.choice / 3) * 3 + wrap(m.choice + move.x, 3);
+        if (move.y) m.choice = (m.choice + 3) % powers.length;
+        if (this.confirm(owner) && c.levels[m.choice] < 3) {
+          if (c.slots.includes(m.choice) || c.slots.includes(-1)) { m.upgrade(c, m.choice); m.nextDraft(); }
+          else { m.draftMode = 'slot'; m.draftSlot = 0; }
+          clearInput();
+        }
+      }
     } else if (m.phase === 'champion') {
       this.recordMatch(); m.timer += dt;
-      if (m.timer > 1 && (tap('P1_1') || tap('P2_1') || tap('START1') || tap('START2'))) { this.match = new Championship(m.humans); this.match.totalSeconds = 0; clearInput(); }
-      else if (m.timer > 1 && (tap('P1_2') || tap('P2_2'))) { this.match = new Championship(); this.match.phase = 'title'; clearInput(); }
+      if (move.y) m.endChoice = 1 - m.endChoice;
+      if (m.timer > 0.6 && this.confirm(owner)) {
+        if (m.endChoice === 0) this.startMatch(m.humans, m.track.seed !== 0);
+        else this.showTitle();
+      }
     }
   }
   update(time, delta) {
@@ -568,15 +721,17 @@ class CabinetScene extends Phaser.Scene {
       if (m.phase === 'countdown') {
         this.plate(309, 223, 182, 154, 0x1a1f2e);
         this.text(m.timer > 0.5 ? String(Math.ceil(m.timer - 0.5)) : '¡YA!', 400, 275, 58, 0xff9a2e, true, true);
-        this.text('← → GIRAR', 400, 337, 18, 0xf2f5fb, true);
+        this.text('P1: A / D GIRAR', 400, 331, 16, palette[0], true);
+        this.text('Gira respecto al auto', 400, 356, 14, 0xcbd4e4, true);
       }
       if (m.phase === 'results' || m.phase === 'champion') this.results(m.phase === 'champion');
       if (m.phase === 'workshop') this.workshopScreen();
       if (m.phase === 'draft') this.draftScreen();
       if (m.phase === 'paused') {
         this.dim(0.9); this.text('EN EL GARAJE', 400, 249, 42, 0xff9a2e, true, true);
-        this.text('La carrera espera por ti.', 400, 309, 22, 0xf2f5fb, true);
-        this.key('START / 1   CONTINUAR', 235, 366, 330);
+        this.text('Pausa de P' + (this.pauseOwner + 1), 400, 309, 22, palette[this.pauseOwner], true);
+        this.key('CONTINUAR', 235, 366, 330);
+        this.text(this.menuHint(this.pauseOwner), 400, 449, 16, palette[this.pauseOwner], true);
       }
     }
     for (let i = this.labelIndex; i < this.labels.length; i++) this.labels[i].setVisible(false);

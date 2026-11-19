@@ -1,7 +1,7 @@
 /* Nitro Nonsense: Cabinet Edition. Adapted from the owner's Scrap party racer.
    Four cars share one simulation with seeded track geometry and physical lap gates.
    Artwork is deterministic game geometry; display type is the original Scrapline.
-   Music: 8-bit-style edit of Ska del Último Perno, from the original Scrap soundtrack. */
+   Music uses note patterns and individual instrument samples from Scrap's Centro score. */
 const CABINET_KEYS = {
   P1_U: ['w'], P1_D: ['s'], P1_L: ['a'], P1_R: ['d'],
   P1_1: ['u'], P1_2: ['i'], P1_3: ['o'],
@@ -31,11 +31,17 @@ const modifiers = [
   { name: 'MINA FIJA', color: 0xf7d36b, detail: 'Explota y se recarga en 3 s.', radius: 20 },
   { name: 'PINCHOS', color: 0xcbd4e4, detail: 'Te frenan durante 1.8 s.', radius: 21 },
   { name: 'RAMPA', color: 0x42baf8, detail: 'Salta sobre autos y trampas.', radius: 22 },
-  { name: 'MARTILLO', color: 0xf08db9, detail: 'Recorre el tramo y avisa antes de golpear.', radius: 25 },
+  { name: 'BOLA DE DEMOLICIÓN', color: 0xffc579, detail: 'Cruza de lado a lado y golpea al tocarte.', radius: 24, reach: 30 },
   { name: 'PUERTAS', color: 0x52e5be, detail: 'Un carril abre y el otro se cierra.', radius: 0 },
+  { name: 'IMÁN', color: 0x8ba9ff, detail: 'Te arrastra hacia el borde señalado.', radius: 0, reach: 67 },
+  { name: 'PORTAL', color: 0xe7a3ff, detail: 'Te devuelve a un tramo anterior.', radius: 21, reach: 125 },
+  { name: 'HIELO', color: 0xa0e3fa, detail: 'Tramo grande con menos agarre.', radius: 0, reach: 76 },
+  { name: 'CAÑÓN FIJO', color: 0xffa978, detail: 'Dispara proyectiles de lado a lado.', radius: 0, reach: 30 },
 ];
-const hammerKind = 7, doorsKind = 8, hammerReach = 92, doorInterval = 2.6;
-const tuning = { step: 1 / 120, pace: 1.12, laps: 2, wins: 5, road: 38, gateWidth: 80, maxModifiers: 16 };
+const ballKind = 7, doorsKind = 8, magnetKind = 9, portalKind = 10, iceKind = 11, cannonKind = 12;
+const doorInterval = 2.6, cannonInterval = 2.35;
+const magnetReach = modifiers[magnetKind].reach, portalReach = modifiers[portalKind].reach, iceReach = modifiers[iceKind].reach;
+const tuning = { step: 1 / 120, pace: 1.12, topSpeed: 162, laps: 2, wins: 5, road: 38, gateWidth: 80, maxModifiers: 16, jumpSeconds: 1.26 };
 const trackSizes = [{ name: 'COMPACTA', width: 1060, height: 760 }, { name: 'GRANDE', width: 1640, height: 1080 }];
 const held = Object.create(null), pressed = Object.create(null), keyMap = Object.create(null);
 for (const [code, keys] of Object.entries(CABINET_KEYS)) for (const key of keys) keyMap[key.toLowerCase()] = code;
@@ -59,6 +65,11 @@ function hex(color) { return '#' + color.toString(16).padStart(6, '0'); }
 
 function newSeed() { return (Math.random() * 4294967296) >>> 0 || 1; }
 function doorSide(time) { return Math.floor(time / doorInterval) % 2 ? 1 : -1; }
+function sideTrap(kind) { return kind === magnetKind || kind === cannonKind; }
+function fullRoadTrap(kind) { return kind === ballKind || kind === doorsKind || kind === iceKind; }
+function lateralPoint(anchor, lane) {
+  return { x: anchor.x - Math.sin(anchor.angle) * lane, y: anchor.y + Math.cos(anchor.angle) * lane };
+}
 
 class Circuit {
   constructor(seed, size) {
@@ -158,7 +169,7 @@ class Championship {
     this.beginRace();
   }
   beginRace() {
-    for (const modifier of this.modifiers) modifier.readyAt = 0;
+    for (const modifier of this.modifiers) modifier.readyAt = modifier.kind === cannonKind ? 1.25 : 0;
     this.round++; this.phase = 'countdown'; this.timer = 2.5; this.elapsed = 0;
     this.shots.length = 0; this.hazards.length = 0; this.effects.length = 0; this.finishOrder = [];
     for (const c of this.cars) {
@@ -184,7 +195,10 @@ class Championship {
     c.cooldowns[slot] = powers[kind].cd / (1 + (level - 1) * 0.18);
     if (kind === 0) { c.boost = 1 + level * 0.15; this.burst(c.x, c.y, powers[kind].color, 16); }
     if (kind === 1) this.shots.push({ x: c.x + x * 18, y: c.y + y * 18, vx: x * 460 + c.vx, vy: y * 460 + c.vy, owner: c.id, life: 1.4 });
-    if (kind === 2 || kind === 3) this.hazards.push({ x: c.x - x * 22, y: c.y - y * 22, kind, owner: c.id, life: kind === 2 ? 12 : 18, age: 0, radius: kind === 2 ? 17 + level * 2 : 10 });
+    if (kind === 2 || kind === 3) {
+      const px = c.x - x * 22, py = c.y - y * 22;
+      this.hazards.push({ x: px, y: py, angle: this.track.project(px, py).angle, kind, owner: c.id, life: kind === 2 ? 12 : 18, age: 0, radius: kind === 2 ? 17 + level * 2 : 10 });
+    }
     if (kind === 4) { c.shield = 2 + level * 0.7; this.burst(c.x, c.y, powers[kind].color, 32); }
     if (kind === 5) {
       const radius = 64 + level * 10;
@@ -210,18 +224,25 @@ class Championship {
     this.phase = 'workshop'; this.workshopMode = 'choice'; this.timer = 18; this.choice = 0; this.placeS = this.track.length * 0.22; this.lane = 0;
   }
   canPlace(s, lane) {
-    const p = this.track.at(s, this.choice === doorsKind ? 0 : lane), seam = Math.min(p.s, this.track.length - p.s);
-    const reach = this.choice === hammerKind ? hammerReach : 0;
-    return this.modifiers.length < tuning.maxModifiers && seam > 100 + reach && this.modifiers.every(m => {
+    const p = this.trapAnchor(s, lane), seam = Math.min(p.s, this.track.length - p.s);
+    const reach = modifiers[this.choice].reach || 0, seamPadding = this.choice === iceKind || this.choice === ballKind ? reach : 0;
+    if (this.choice === portalKind && !this.portalFits(p.s)) return false;
+    return this.modifiers.length < tuning.maxModifiers && seam > 100 + seamPadding && this.modifiers.every(m => {
       const distance = Math.abs(m.s - p.s);
+      const field = reach + (modifiers[m.kind].reach || 0);
       return Math.hypot(m.x - p.x, m.y - p.y) > 34 &&
-        Math.min(distance, this.track.length - distance) > 25 + reach + (m.kind === hammerKind ? hammerReach : 0);
+        Math.min(distance, this.track.length - distance) > 25 + field;
     });
   }
+  portalFits(distance) {
+    const sector = this.track.length / 4, offset = wrap(distance, sector);
+    return offset >= portalReach + 39 && offset <= sector - 39;
+  }
+  trapAnchor(s, lane) { return this.track.at(s, fullRoadTrap(this.choice) || sideTrap(this.choice) ? 0 : lane); }
   place() {
     if (!this.canPlace(this.placeS, this.lane)) return false;
-    const lane = this.choice === doorsKind ? 0 : this.lane;
-    this.modifiers.push({ ...this.track.at(this.placeS, lane), lane, kind: this.choice });
+    const lane = fullRoadTrap(this.choice) ? 0 : this.lane;
+    this.modifiers.push({ ...this.trapAnchor(this.placeS, lane), lane, kind: this.choice });
     return true;
   }
   nextDraft() {
@@ -234,10 +255,11 @@ class Championship {
     this.choice = available;
   }
   startDraft() { this.drafters = this.standings.slice(1); this.draft = -1; this.nextDraft(); }
-  applyModifier(car, modifier, hammer) {
+  applyModifier(car, modifier, ball, dt) {
     const kind = modifier.kind;
-    if (kind === doorsKind || car.air > 0) return;
-    const position = kind === hammerKind ? hammer : modifier;
+    if (kind === doorsKind || kind === cannonKind || kind === iceKind || car.air > 0 || car.finished) return;
+    if (kind === magnetKind) { this.pullMagnet(car, modifier, dt); return; }
+    const position = kind === ballKind ? ball : modifier;
     const dx = car.x - position.x, dy = car.y - position.y;
     if (Math.hypot(dx, dy) >= modifiers[kind].radius) return;
     if (kind === 0) car.slick = 0.8;
@@ -249,14 +271,48 @@ class Championship {
       this.burst(modifier.x, modifier.y, modifiers[kind].color, 54);
     }
     if (kind === 5 && this.hit(car, 0, 0, 0)) car.slow = 1.8;
-    if (kind === 6) { car.air = 0.85; this.burst(car.x, car.y, modifiers[kind].color, 30); }
-    if (kind === hammerKind && hammer.striking) this.hit(car, dx || 1, dy, 190);
+    if (kind === 6) { car.air = tuning.jumpSeconds; this.burst(car.x, car.y, modifiers[kind].color, 30); }
+    if (kind === ballKind) this.hit(car, dx || -Math.sin(modifier.angle), dy || Math.cos(modifier.angle), 190);
+    if (kind === portalKind && this.elapsed >= (modifier.readyAt || 0)) this.rewindPortal(car, modifier);
   }
-  hammer(modifier, time = this.elapsed) {
-    const phase = wrap(time + modifier.s / 105, 2.7);
-    return { ...this.track.at(modifier.s + hammerReach * Math.sin(phase * Math.PI * 2 / 2.7), modifier.lane), warning: phase > 1.52, striking: phase > 2.06 };
+  pullMagnet(car, modifier, dt) {
+    const x = Math.cos(modifier.angle), y = Math.sin(modifier.angle), sign = modifier.lane < 0 ? -1 : 1;
+    const dx = car.x - modifier.x, dy = car.y - modifier.y;
+    const along = Math.abs(dx * x + dy * y), lane = (dy * x - dx * y) * sign;
+    if (along >= magnetReach || Math.abs(lane) > 46 || car.shield > 0) return;
+    const force = 380 * (1 - along / magnetReach) * dt * sign;
+    car.vx -= y * force;
+    car.vy += x * force;
+  }
+  portalExit(modifier) {
+    return this.track.at(modifier.s - portalReach, modifier.lane > 0 ? -22 : 22);
+  }
+  rewindPortal(car, modifier) {
+    modifier.readyAt = this.elapsed + 3;
+    this.burst(car.x, car.y, 0xe7a3ff, 38);
+    if (car.shield > 0) { car.shield = 0; return; }
+    const exit = this.portalExit(modifier), length = this.track.length;
+    const before = this.track.project(car.x, car.y).s;
+    const rewind = wrap(before - exit.s + length / 2, length) - length / 2;
+    const speed = Math.hypot(car.vx, car.vy) * 0.8;
+    Object.assign(car, exit, { vx: Math.cos(exit.angle) * speed, vy: Math.sin(exit.angle) * speed, safeS: exit.s });
+    car.progress -= Math.max(0, rewind);
+    car.gateTravel = Math.max(0, car.gateTravel - rewind);
+    car.bestProgress = car.progress;
+    car.stuck = 0;
+    this.burst(exit.x, exit.y, 0x62e4f1, 38);
+  }
+  wreckingBall(modifier, time = this.elapsed) {
+    return lateralPoint(modifier, 53 * Math.sin(time * 2.55 + modifier.s / 105));
+  }
+  fireTrackCannon(modifier) {
+    if (this.elapsed < modifier.readyAt || this.shots.length >= 24) return;
+    modifier.readyAt = this.elapsed + cannonInterval;
+    const side = modifier.lane < 0 ? -1 : 1, muzzle = lateralPoint(modifier, side * 37);
+    this.shots.push({ ...muzzle, vx: Math.sin(modifier.angle) * side * 270, vy: -Math.cos(modifier.angle) * side * 270, owner: -1, life: 0.43 });
   }
   blockDoor(car, door, oldX, oldY) {
+    if (car.air > 0) return;
     const x = Math.cos(door.angle), y = Math.sin(door.angle);
     const dx = car.x - door.x, dy = car.y - door.y;
     const along = dx * x + dy * y, lane = (dy * x - dx * y) * doorSide(this.elapsed);
@@ -280,10 +336,12 @@ class Championship {
     if (this.phase === 'countdown') { this.timer -= dt; if (this.timer <= 0) this.phase = 'race'; return; }
     if (this.phase !== 'race' && !demo) return;
     this.elapsed += dt;
-    const doors = [], hammers = new Map();
+    const doors = [], icePatches = [], balls = new Map();
     for (const modifier of this.modifiers) {
       if (modifier.kind === doorsKind) doors.push(modifier);
-      if (modifier.kind === hammerKind) hammers.set(modifier, this.hammer(modifier));
+      if (modifier.kind === ballKind) balls.set(modifier, this.wreckingBall(modifier));
+      if (modifier.kind === iceKind) icePatches.push(modifier);
+      if (modifier.kind === cannonKind) this.fireTrackCannon(modifier);
     }
     for (const c of this.cars) {
       if (c.finished) continue;
@@ -316,13 +374,14 @@ class Championship {
       const forward = c.vx * Math.cos(c.angle) + c.vy * Math.sin(c.angle);
       c.angle += steering * 3.25 * tuning.pace * clamp(Math.abs(forward) / 65, 0.1, 1) * (forward < -3 ? -1 : 1) * (c.stun > 0 ? 0.2 : 1) * dt;
       const offroad = p.distance > tuning.road;
-      const speedLimit = (c.human && !demo ? 182 : 156 + c.id * 2) * tuning.pace * (c.boost > 0 ? 1.5 : 1) * (offroad ? 0.42 : 1) * (c.slow > 0 ? 0.5 : 1);
+      const onIce = !offroad && c.air <= 0 && icePatches.some(patch => Math.abs(patch.s - p.s) < iceReach);
+      const speedLimit = tuning.topSpeed * tuning.pace * (c.boost > 0 ? 1.5 : 1) * (offroad ? 0.42 : 1) * (c.slow > 0 ? 0.5 : 1);
       const targetSpeed = brake ? -55 : speedLimit;
       const motor = (brake && forward > 0 ? 260 : 140) * tuning.pace;
       let nextSpeed = forward + clamp(targetSpeed - forward, -motor * dt, motor * dt);
       if (c.stun > 0) nextSpeed *= 1 - dt * 1.4;
       const lateral = -c.vx * Math.sin(c.angle) + c.vy * Math.cos(c.angle);
-      const slip = lateral * Math.max(0, 1 - dt * (c.slick > 0 ? 0.8 : offroad ? 4 : 9));
+      const slip = lateral * Math.max(0, 1 - dt * (c.slick > 0 ? 0.8 : onIce ? 3.2 : offroad ? 4 : 9));
       c.vx = Math.cos(c.angle) * nextSpeed - Math.sin(c.angle) * slip;
       c.vy = Math.sin(c.angle) * nextSpeed + Math.cos(c.angle) * slip;
       this.moveCar(c, oldX, oldY, dt);
@@ -353,7 +412,7 @@ class Championship {
         c.x = safe.x; c.y = safe.y; c.angle = safe.angle; c.vx = 0; c.vy = 0; c.stuck = 0;
         this.burst(c.x, c.y, 0xffffff, 20);
       }
-      for (const modifier of this.modifiers) this.applyModifier(c, modifier, hammers.get(modifier));
+      for (const modifier of this.modifiers) this.applyModifier(c, modifier, balls.get(modifier), dt);
     }
     for (let i = 0; i < 4; i++) for (let j = i + 1; j < 4; j++) {
       const a = this.cars[i], b = this.cars[j];
@@ -396,17 +455,45 @@ class Championship {
 
 let sceneRef;
 let musicContext;
+function renderCabinetMusic(context) {
+  const sampleRate = 24000, samplesPerBeat = sampleRate * 60 / 144;
+  const chords = [[57, 60, 64], [53, 57, 60], [48, 52, 55], [55, 59, 62], [52, 56, 59, 62]];
+  const roots = [45, 41, 36, 43, 40];
+  const length = samplesPerBeat * chords.length * 4;
+  const buffer = context.createBuffer(1, length, sampleRate);
+  const output = buffer.getChannelData(0);
+  const [keys, bass] = cabinetSamples.map(data => Float32Array.from(atob(data), value => (value.charCodeAt(0) - 128) / 127));
+  function note(wave, cycles, beat, pitch, beats, volume, tail) {
+    const start = Math.round(beat * samplesPerBeat), hold = Math.round(beats * samplesPerBeat);
+    const release = Math.round(tail * sampleRate), attack = sampleRate * 0.012;
+    const step = wave.length * (440 * 2 ** ((pitch - 69) / 12)) / (sampleRate * cycles);
+    let phase = 0;
+    for (let i = 0; i < hold + release; i++) {
+      const index = Math.floor(phase), fraction = phase - index;
+      const sample = wave[index] + (wave[(index + 1) % wave.length] - wave[index]) * fraction;
+      const envelope = Math.min(1, i / attack) * (1 - 0.34 * Math.min(i / hold, 1)) * Math.min(1, (hold + release - i) / release);
+      // Release tails continue across the loop boundary.
+      output[(start + i) % length] += sample * envelope * volume;
+      phase = (phase + step) % wave.length;
+    }
+  }
+  for (const [bar, chord] of chords.entries()) {
+    const beat = bar * 4, root = roots[bar];
+    for (let i = 0; i < 4; i++) note(keys, 6, beat + i + 0.5, chord[(i + 1) % chord.length] + 12, 0.23, 0.22, 0.14);
+    for (const [offset, pitch, duration] of [[0, root, 0.7], [1.5, root + 12, 0.35], [2, root + 7, 0.65], [3.25, root + 12, 0.45]]) {
+      note(bass, 3, beat + offset, pitch, duration, 0.26, 0.18);
+    }
+  }
+  return buffer;
+}
 function playMusic() {
   if (!window.AudioContext || !sceneRef || sceneRef.match.phase === 'paused' || document.hidden) return;
   if (!musicContext) {
     musicContext = new AudioContext();
-    const bytes = Uint8Array.from(atob(cabinetMusic), value => value.charCodeAt(0));
-    musicContext.decodeAudioData(bytes.buffer).then(buffer => {
-      const music = musicContext.createBufferSource(), volume = musicContext.createGain();
-      music.buffer = buffer; music.loop = true; volume.gain.value = 0.38;
-      music.connect(volume).connect(musicContext.destination);
-      music.start();
-    }).catch(() => {});
+    const music = musicContext.createBufferSource(), volume = musicContext.createGain();
+    music.buffer = renderCabinetMusic(musicContext); music.loop = true; volume.gain.value = 0.42;
+    music.connect(volume).connect(musicContext.destination);
+    music.start();
   }
   if (musicContext.state !== 'running') musicContext.resume().catch(() => {});
 }
@@ -570,7 +657,7 @@ class CabinetScene extends Phaser.Scene {
   }
   car(c, scale = 1) {
     const g = this.ink, a = c.angle, sx = Math.cos(a), sy = Math.sin(a);
-    const lift = c.air > 0 ? Math.sin(c.air / 0.85 * Math.PI) * 16 : 0;
+    const lift = c.air > 0 ? Math.sin(c.air / tuning.jumpSeconds * Math.PI) * 16 : 0;
     if (lift > 0) g.fillStyle(0x030608, 0.7).fillEllipse(c.x + 3, c.y + 3, 27, 15);
     const poly = (points, color, offset = 0) => {
       g.fillStyle(color).fillPoints(points.map(([x, y]) => ({ x: c.x + (x * sx - y * sy) * scale + offset, y: c.y - lift + (x * sy + y * sx) * scale + offset })), true);
@@ -590,7 +677,11 @@ class CabinetScene extends Phaser.Scene {
     g.clear(); this.overlay.clear(); this.labelIndex = 0;
     for (const h of m.modifiers) this.modifier(h.x, h.y, h.kind, true, h);
     for (const h of m.hazards) {
-      if (h.kind === 2) { g.fillStyle(0x10101c, 0.9).fillEllipse(h.x, h.y, h.radius * 2, h.radius * 1.5); g.lineStyle(2, 0x9574bd).strokeEllipse(h.x, h.y, h.radius * 1.6, h.radius); }
+      if (h.kind === 2) {
+        g.save().translateCanvas(h.x, h.y).rotateCanvas(h.angle);
+        g.fillStyle(0x10101c, 0.9).fillEllipse(0, 0, h.radius * 2, h.radius * 1.5);
+        g.lineStyle(2, 0x9574bd).strokeEllipse(0, 0, h.radius * 1.6, h.radius).restore();
+      }
       else { g.fillStyle(0xf7d36b).fillCircle(h.x, h.y, 7); g.fillStyle(h.age > 0.5 && this.age % 0.3 < 0.15 ? 0xef4b4c : 0x3c3232).fillCircle(h.x, h.y, 3); }
     }
     for (const c of m.cars) {
@@ -601,18 +692,23 @@ class CabinetScene extends Phaser.Scene {
         this.text(c.name, 400 + (c.x - this.viewX) * zoom, 297.5 + (c.y - this.viewY) * zoom - 18, 13, c.color, true);
       }
     }
-    for (const h of m.modifiers) if (h.kind === hammerKind) this.hammerSignal(g, m.hammer(h));
-    for (const s of m.shots) { g.lineStyle(4, 0xffdd8d).lineBetween(s.x, s.y, s.x - s.vx * 0.018, s.y - s.vy * 0.018); }
+    for (const s of m.shots) {
+      const fixed = s.owner < 0;
+      g.lineStyle(fixed ? 6 : 4, fixed ? 0xff9a52 : 0xffdd8d).lineBetween(s.x, s.y, s.x - s.vx * (fixed ? 0.065 : 0.018), s.y - s.vy * (fixed ? 0.065 : 0.018));
+      if (fixed) g.fillStyle(0xffe8bf).fillCircle(s.x, s.y, 5);
+    }
     for (const e of m.effects) g.lineStyle(3, e.color, e.life / 0.55).strokeCircle(e.x, e.y, e.radius * (1 - e.life / 0.55) + 3);
   }
   modifier(x, y, kind, valid = true, state = null, g = this.ink, preview = false) {
+    const rotated = state && kind < ballKind, worldX = x, worldY = y;
+    if (rotated) { g.save().translateCanvas(x, y).rotateCanvas(state.angle); x = 0; y = 0; }
     if (kind === 0) { g.fillStyle(0x151322).fillEllipse(x, y, 38, 28); g.lineStyle(2, 0xc49bff).strokeEllipse(x, y, 30, 18); }
     if (kind === 1) { g.fillStyle(0x161b28).fillRoundedRect(x - 13, y - 5, 26, 18, 3); g.fillStyle(0xff9a2e).fillTriangle(x, y - 16, x - 10, y + 8, x + 10, y + 8); g.lineStyle(4, 0xf7ecd3).lineBetween(x - 5, y - 3, x + 5, y - 3); }
     if (kind === 2) { g.fillStyle(0x163f35).fillRoundedRect(x - 16, y - 14, 32, 28, 3); g.lineStyle(3, 0x42d07a); for (let i = -7; i < 10; i += 9) g.lineBetween(x + i - 4, y - 7, x + i + 3, y).lineBetween(x + i + 3, y, x + i - 4, y + 7); }
     if (kind === 3) {
-      g.fillStyle(0x181c28).fillRoundedRect(x - 22, y - 12, 44, 27, 3);
-      g.fillStyle(0xcbd4e4).fillRoundedRect(x - 21, y - 13, 42, 20, 3);
-      for (let i = -17; i < 20; i += 14) g.fillStyle(0xef6866).fillRect(x + i, y - 13, 7, 20);
+      g.fillStyle(0x181c28).fillRoundedRect(x - 11, y - 23, 25, 46, 3);
+      g.fillStyle(0xcbd4e4).fillRoundedRect(x - 10, y - 21, 19, 42, 3);
+      for (let i = -17; i < 20; i += 14) g.fillStyle(0xef6866).fillRect(x - 10, y + i, 19, 7);
     }
     if (kind === 4) {
       const ready = !state || this.match.elapsed >= (state.readyAt || 0);
@@ -622,50 +718,86 @@ class CabinetScene extends Phaser.Scene {
       g.fillStyle(ready ? 0xef4b4c : 0x4a5570).fillCircle(x, y, 5);
     }
     if (kind === 5) {
-      g.fillStyle(0x876337).fillRect(x - 22, y - 11, 44, 22);
-      g.fillStyle(0x171d28).fillRect(x - 19, y - 8, 38, 16);
-      for (let i = -15; i < 20; i += 10) g.fillStyle(0xcbd4e4).fillTriangle(x + i - 4, y + 6, x + i, y - 9, x + i + 4, y + 6);
+      g.fillStyle(0x876337).fillRect(x - 11, y - 22, 22, 44);
+      g.fillStyle(0x171d28).fillRect(x - 8, y - 19, 16, 38);
+      for (let i = -15; i < 20; i += 10) g.fillStyle(0xcbd4e4).fillTriangle(x + 6, y + i - 4, x - 9, y + i, x + 6, y + i + 4);
     }
     if (kind === 6) {
-      g.fillStyle(0x18405c).fillRect(x - 20, y - 12, 40, 28);
-      for (let i = -12; i < 18; i += 10) g.lineStyle(3, 0x42baf8).lineBetween(x - 14, y + i * 0.6, x + 14, y + i * 0.6 - 6);
-      g.lineStyle(4, 0x98ddff).lineBetween(x - 20, y - 12, x + 20, y - 12);
+      g.fillStyle(0x18405c).fillRect(x - 20, y - 14, 40, 28);
+      for (const along of [-12, 0]) {
+        g.lineStyle(3, 0x42baf8).lineBetween(x + along, y - 8, x + along + 7, y).lineBetween(x + along + 7, y, x + along, y + 8);
+      }
+      g.lineStyle(4, 0x98ddff).lineBetween(x + 19, y - 14, x + 19, y + 14);
     }
-    if (kind === hammerKind) this.drawHammer(g, x, y, state, preview);
+    if (rotated) g.restore();
+    if (kind === ballKind) this.drawWreckingBall(g, x, y, state, preview);
     if (kind === doorsKind) this.drawDoors(g, x, y, state, preview);
-    if (!valid) g.lineStyle(3, 0xef4b4c).lineBetween(x - 16, y - 16, x + 16, y + 16);
+    if (kind === magnetKind) this.drawMagnet(g, x, y, state);
+    if (kind === portalKind) this.drawPortal(g, x, y, state, preview);
+    if (kind === iceKind) this.drawIce(g, x, y, state);
+    if (kind === cannonKind) this.drawCannon(g, x, y, state, preview);
+    if (!valid) g.lineStyle(3, 0xef4b4c).lineBetween(worldX - 16, worldY - 16, worldX + 16, worldY + 16);
   }
-  drawHammer(g, x, y, state, preview) {
-    const pose = state ? this.match.hammer(state, preview ? this.age : this.match.elapsed) : { x, y, warning: false, striking: false };
+  drawWreckingBall(g, x, y, state, preview) {
+    const pose = state ? this.match.wreckingBall(state, preview ? this.age : this.match.elapsed) : { x: x + 7, y: y + 5 };
+    const anchor = state ? lateralPoint(state, -66) : { x: x - 17, y: y - 16 };
     if (state) {
-      const { track } = this.match;
-      for (let s = -hammerReach; s < hammerReach; s += 14) {
-        const a = track.at(state.s + s, state.lane), b = track.at(state.s + Math.min(s + 8, hammerReach), state.lane);
-        g.lineStyle(4, 0xf08db9, 0.63).lineBetween(a.x, a.y, b.x, b.y);
+      for (let lane = -51; lane <= 47; lane += 12) {
+        const a = lateralPoint(state, lane), b = lateralPoint(state, lane + 6);
+        g.lineStyle(4, 0xffc579, 0.76).lineBetween(a.x, a.y, b.x, b.y);
       }
     }
-    const head = pose.y - (pose.striking ? 11 : 26);
-    g.fillStyle(0x181c28).fillEllipse(pose.x, pose.y + 10, 39, 17);
-    g.lineStyle(7, 0x181c28).lineBetween(pose.x - 13, pose.y + 13, pose.x + 5, head);
-    g.lineStyle(3, 0xe8c0d9).lineBetween(pose.x - 13, pose.y + 12, pose.x + 5, head);
-    g.fillStyle(0xf5a6d8).fillRoundedRect(pose.x - 14, head - 9, 34, 17, 3);
-    g.fillStyle(0x63394a).fillRect(pose.x + 12, head - 7, 5, 13);
-    if (preview) this.hammerSignal(g, pose);
+    g.fillStyle(0x252025).fillCircle(anchor.x, anchor.y, state ? 13 : 6);
+    g.lineStyle(state ? 7 : 4, 0x2b272c).lineBetween(anchor.x, anchor.y, pose.x, pose.y);
+    g.lineStyle(state ? 3 : 2, 0xbeb1a0).lineBetween(anchor.x, anchor.y, pose.x, pose.y);
+    const radius = state ? 21 : 13;
+    g.fillStyle(0x202633).fillCircle(pose.x + 3, pose.y + 5, radius + 2);
+    g.fillStyle(0x69788a).fillCircle(pose.x, pose.y, radius);
+    g.fillStyle(0xaab4bd).fillEllipse(pose.x - radius * 0.22, pose.y - radius * 0.28, radius, radius * 0.53);
+    g.lineStyle(3, 0xffc579).strokeCircle(pose.x, pose.y, radius);
   }
-  hammerSignal(g, { x, y, warning, striking }) {
-    if (!warning) { g.lineStyle(2, 0xf08db9, 0.7).strokeCircle(x, y, 25); return; }
-    g.lineStyle(3, striking ? 0xffede0 : 0xffd36c);
-    for (let i = 0; i < 6; i++) {
-      const a = i * Math.PI / 3, cos = Math.cos(a), sin = Math.sin(a);
-      if (striking) g.lineBetween(x + 27 * cos, y + 27 * sin, x + 37 * cos, y + 37 * sin);
-      else g.beginPath().arc(x, y, 25, a, a + 0.68).strokePath();
+  drawIce(g, x, y, state) {
+    if (state) {
+      const track = this.match.track, left = [], right = [];
+      for (let delta = -iceReach; delta <= iceReach; delta += 8) {
+        left.push(track.at(state.s + delta, -37)); right.push(track.at(state.s + delta, 37));
+      }
+      g.fillStyle(0x64c4e3, 0.68).fillPoints(left.concat(right.reverse()), true);
+      g.lineStyle(2, 0xc4efff, 0.84).strokePoints(left.concat(right), true);
+    } else {
+      g.fillStyle(0x478ba8).fillRoundedRect(x - 22, y - 15, 44, 30, 3);
+      g.lineStyle(2, 0xa0e3fa).strokeRoundedRect(x - 22, y - 15, 44, 30, 3);
     }
-    if (striking) g.strokeCircle(x, y, 24);
+    const crests = state ? [-51, -18, 21, 53] : [0];
+    for (const along of crests) {
+      const p = state ? this.match.track.at(state.s + along, along % 2 ? 15 : -14) : { x, y, angle: 0 };
+      g.save().translateCanvas(p.x, p.y).rotateCanvas(p.angle);
+      g.lineStyle(2, 0xe1f8ff, 0.9).strokePoints([{ x: -10, y: -8 }, { x: 0, y: -1 }, { x: -2, y: 4 }, { x: 10, y: 8 }]).restore();
+    }
+  }
+  drawCannon(g, x, y, state, preview) {
+    const side = state?.lane < 0 ? -1 : 1, base = state ? side * 58 : 8;
+    const remaining = state && !preview ? (state.readyAt || 1.25) - this.match.elapsed : 0.25;
+    const warning = remaining < 0.42;
+    g.save().translateCanvas(x, y).rotateCanvas(state?.angle || 0);
+    if (state) {
+      for (let lane = -32; lane <= 32; lane += 13) {
+        g.lineStyle(warning ? 4 : 2, 0xffbd70, warning ? 0.86 : 0.44).lineBetween(0, lane, 0, lane + 6);
+      }
+    }
+    g.fillStyle(0x20222b).fillRoundedRect(-15, base - 12, 30, 24, 5);
+    g.fillStyle(0x93665f).fillCircle(0, base, 12);
+    const mouth = base - side * 19;
+    g.lineStyle(16, 0x2c252c).lineBetween(0, base, 0, mouth);
+    g.lineStyle(12, 0xb6836c).lineBetween(0, base, 0, mouth);
+    if (warning && state) g.fillStyle(0xffb36a, 0.45).fillCircle(0, mouth, 10);
+    g.lineStyle(6, warning ? 0xffd485 : 0x514755).lineBetween(-6, mouth, 6, mouth);
+    g.restore();
   }
   drawDoors(g, x, y, state, preview) {
     const time = state && !preview ? this.match.elapsed : this.age;
     const angle = state ? state.angle : 0;
-    const cos = Math.cos(angle), sin = Math.sin(angle), scale = state ? 1 : 0.6;
+    const cos = Math.cos(angle), sin = Math.sin(angle), scale = state ? 1 : 0.51;
     const at = (along, lane) => ({ x: x + (along * cos - lane * sin) * scale, y: y + (along * sin + lane * cos) * scale });
     const closed = doorSide(time), open = -closed;
     const warning = wrap(time, doorInterval) > doorInterval - 0.55;
@@ -682,6 +814,51 @@ class CabinetScene extends Phaser.Scene {
       g.fillStyle(0x171d28).fillCircle(p.x, p.y, 7 * scale);
       g.fillStyle(side === closed ? 0xff766d : color).fillCircle(p.x, p.y, 4 * scale);
     }
+  }
+  drawMagnet(g, x, y, state) {
+    const side = state?.lane < 0 ? -1 : 1, angle = state?.angle || 0;
+    const cos = Math.cos(angle), sin = Math.sin(angle), scale = state ? 1 : 0.7;
+    const at = (along, lane) => {
+      const lateral = state ? lane * side : lane - 51;
+      return { x: x + (along * cos - lateral * sin) * scale, y: y + (along * sin + lateral * cos) * scale };
+    };
+    if (state) {
+      g.fillStyle(0x778fff, 0.13).fillPoints([at(-magnetReach, -46), at(magnetReach, -46), at(magnetReach, 46), at(-magnetReach, 46)], true);
+      for (const along of [-43, 0, 43]) {
+        for (const lane of [-19, 5, 29]) {
+          const alpha = 0.7 + Math.sin(this.age * 9 - lane * 0.11) * 0.24;
+          g.lineStyle(3, 0xaabaff, alpha).strokePoints([at(along - 9, lane - 6), at(along, lane + 2), at(along + 9, lane - 6)]);
+        }
+      }
+    }
+    const fixture = [at(-17, 43), at(-17, 59), at(-10, 66), at(10, 66), at(17, 59), at(17, 43)];
+    g.lineStyle(14 * scale, 0x172342).strokePoints(fixture);
+    g.lineStyle(9 * scale, 0x8ba9ff).strokePoints(fixture);
+    for (const along of [-17, 17]) g.lineStyle(10 * scale, 0xf9c4be).strokePoints([at(along, 43), at(along, 49)]);
+  }
+  drawPortal(g, x, y, state, preview) {
+    const scale = state ? 1 : 0.7;
+    const remaining = !state || preview ? 0 : Math.max(0, (state.readyAt || 0) - this.match.elapsed);
+    const ready = remaining === 0;
+    const exit = state ? this.match.portalExit(state) : { x: x - 25, y };
+    if (state) {
+      const track = this.match.track, exitLane = state.lane > 0 ? -22 : 22;
+      for (let d = 20; d < portalReach - 14; d += 13) {
+        const p = track.at(state.s - d, state.lane + (exitLane - state.lane) * d / portalReach);
+        g.fillStyle(d < portalReach / 2 ? 0xe7a3ff : 0x62e4f1, ready ? 0.8 : 0.36).fillCircle(p.x, p.y, 2.5);
+      }
+    }
+    g.save().translateCanvas(exit.x, exit.y).rotateCanvas(exit.angle || 0);
+    g.fillStyle(0x102833, 0.88).fillEllipse(0, 0, 34 * scale, 27 * scale);
+    g.lineStyle(3 * scale, 0x62e4f1, ready ? 1 : 0.5).strokeEllipse(0, 0, 34 * scale, 27 * scale);
+    g.lineStyle(2 * scale, 0x62e4f1).lineBetween(-6 * scale, -2 * scale, 6 * scale, -2 * scale);
+    g.lineBetween(-6 * scale, 3 * scale, 6 * scale, 3 * scale).restore();
+    g.save().translateCanvas(x, y).rotateCanvas(state?.angle || 0);
+    g.fillStyle(0x322044, 0.92).fillEllipse(0, 0, 41 * scale, 33 * scale);
+    g.lineStyle(3 * scale, ready ? 0xe7a3ff : 0x7d628c).strokeEllipse(0, 0, 41 * scale, 33 * scale);
+    if (!ready) g.lineStyle(2, 0xe7a3ff).beginPath().arc(0, 0, 23, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (1 - remaining / 3)).strokePath();
+    g.lineStyle(3 * scale, ready ? 0xe7a3ff : 0x7d628c)
+      .strokePoints([{ x: 6 * scale, y: -7 * scale }, { x: -6 * scale, y: 0 }, { x: 6 * scale, y: 7 * scale }]).restore();
   }
   hud() {
     const m = this.match;
@@ -737,7 +914,7 @@ class CabinetScene extends Phaser.Scene {
     const records = [];
     if (this.best !== null) records.push('ORIGINAL ' + this.best.toFixed(1) + ' s');
     if (this.legacyBest !== null) records.push('LEGADO ' + this.legacyBest.toFixed(1) + ' s');
-    this.text(records.length ? 'RÉCORDS: ' + records.join(' · ') : '9 PIEZAS DE PISTA · 6 PODERES · 2 VUELTAS', 400, 588, 13, 0x8c98af, true);
+    this.text(records.length ? 'RÉCORDS: ' + records.join(' · ') : modifiers.length + ' PIEZAS DE PISTA · 6 PODERES · 2 VUELTAS', 400, 588, 13, 0x8c98af, true);
   }
   results(champion = false) {
     const m = this.match;
@@ -769,25 +946,33 @@ class CabinetScene extends Phaser.Scene {
       this.text(m.winner.name + ' · TALLER DE TRAMPAS', 400, 38, 27, m.winner.color, true, true);
       this.text('Las piezas quedan en la pista durante todo el campeonato.', 400, 76, 16, 0xcbd4e4, true);
       for (let i = 0; i <= modifiers.length; i++) {
-        const x = 32 + i % 2 * 372, y = 105 + Math.floor(i / 2) * 85, selected = m.choice === i;
+        const x = 32 + i % 2 * 372, y = 96 + Math.floor(i / 2) * 63, selected = m.choice === i;
         const item = modifiers[i] || { name: 'OMITIR', detail: 'Seguir sin agregar una pieza.', color: 0xcbd4e4 };
-        this.plate(x, y, 364, 76, selected ? 0x3c4661 : 0x1a1f2e, selected ? 0x42baf8 : 0x4a5570);
-        if (i < modifiers.length) this.modifier(x + 324, y + 38, i, true, null, this.overlay);
-        this.text(item.name, x + 16, y + 23, 20, item.color, false, true);
-        this.text(item.detail, x + 16, y + 52, 14, 0xcbd4e4);
+        this.plate(x, y, 364, 55, selected ? 0x3c4661 : 0x1a1f2e, selected ? 0x42baf8 : 0x4a5570);
+        if (i < modifiers.length) this.modifier(x + 324, y + 27, i, true, null, this.overlay);
+        this.text(item.name, x + 16, y + 17, 18, item.color, false, true);
+        this.text(item.detail, x + 16, y + 39, 14, 0xcbd4e4);
       }
       this.text(this.menuHint(owner, 'elegir'), 400, 555, 16, m.winner.color, true);
       this.text(m.modifiers.length + ' / ' + tuning.maxModifiers + ' piezas colocadas · Puedes elegir OMITIR', 400, 585, 14, 0x8c98af, true);
       return;
     }
-    const doors = m.choice === doorsKind, lane = doors ? 0 : m.lane;
-    const p = m.track.at(m.placeS, lane), valid = m.canPlace(m.placeS, lane);
+    const kind = m.choice, portal = kind === portalKind;
+    const p = m.trapAnchor(m.placeS, m.lane), valid = m.canPlace(m.placeS, m.lane);
     this.overlay.fillStyle(0x0e1018).fillRect(0, 0, 800, 94).fillRect(0, 501, 800, 99);
     this.text(m.winner.name + ' · ' + (owner < 0 ? 'ESTÁ EDITANDO' : 'UBICA ' + modifiers[m.choice].name), 24, 31, 23, m.winner.color);
-    this.text(owner === 0 ? 'A/D recorrer pista' + (doors ? '' : ' · W/S cambiar carril') + ' · U colocar · I volver' : owner === 1 ? '←/→ recorrer pista' + (doors ? '' : ' · ↑/↓ cambiar carril') + ' · R colocar · T volver' : 'Espera a que el bot coloque su pieza.', 24, 70, 16, 0xf2f5fb);
-    this.modifier(p.x, p.y, m.choice, valid, { ...p, lane }, this.ink, true);
-    this.text(doors ? 'Flechas: carril abierto · Barrera: carril cerrado' : m.choice === hammerKind ? 'Aro amarillo: aviso · Destello: golpe' : modifiers[m.choice].detail, 400, 523, 16, modifiers[m.choice].color, true);
-    this.text(valid ? 'Posición libre' : m.modifiers.length >= tuning.maxModifiers ? 'Pista llena. Vuelve y elige OMITIR.' : 'Busca un lugar libre, lejos de la salida.', 400, 553, 17, valid ? 0xf2f5fb : 0xef6866, true);
+    const action = sideTrap(kind) ? ' cambiar lado' : ' cambiar carril';
+    this.text(owner === 0 ? 'A/D recorrer pista' + (fullRoadTrap(kind) ? '' : ' · W/S' + action) + ' · U colocar · I volver' : owner === 1 ? '←/→ recorrer pista' + (fullRoadTrap(kind) ? '' : ' · ↑/↓' + action) + ' · R colocar · T volver' : 'Espera a que el bot coloque su pieza.', 24, 70, 16, 0xf2f5fb);
+    this.modifier(p.x, p.y, kind, valid, { ...p, lane: m.lane }, this.ink, true);
+    const help = kind === doorsKind ? 'Flechas: carril abierto · Barrera: carril cerrado' :
+      kind === magnetKind ? 'Las flechas indican hacia dónde te arrastra.' :
+      portal ? 'Entrada violeta · Salida celeste, más atrás en la pista' :
+      kind === cannonKind ? 'El cañón se ilumina antes de disparar.' :
+      kind === iceKind ? 'Afecta todo el ancho. Resbala menos que el aceite.' : modifiers[kind].detail;
+    const warning = m.modifiers.length >= tuning.maxModifiers ? 'Pista llena. Vuelve y elige OMITIR.' :
+      portal && !m.portalFits(p.s) ? 'Mueve ambos a un tramo entre dos controles.' : 'Busca un lugar libre, lejos de la salida.';
+    this.text(help, 400, 523, 16, modifiers[m.choice].color, true);
+    this.text(valid ? 'Posición libre' : warning, 400, 553, 17, valid ? 0xf2f5fb : 0xef6866, true);
     this.text('Fuera de la salida y separada de otras piezas. ' + m.modifiers.length + ' / ' + tuning.maxModifiers, 400, 585, 14, 0x8c98af, true);
   }
   draftScreen() {
@@ -844,13 +1029,13 @@ class CabinetScene extends Phaser.Scene {
         if (move.y) m.choice = wrap(m.choice + move.y * 2, modifiers.length + 1);
         if (this.confirm(owner)) {
           if (m.choice === modifiers.length) m.startDraft();
-          else { m.workshopMode = 'placement'; if (m.choice === doorsKind) m.lane = 0; }
+          else { m.workshopMode = 'placement'; if (fullRoadTrap(m.choice)) m.lane = 0; }
           clearInput();
         }
       } else {
         const prefix = 'P' + (owner + 1) + '_';
         m.placeS = wrap(m.placeS + (Number(!!held[prefix + 'R']) - Number(!!held[prefix + 'L'])) * 220 * dt, m.track.length);
-        if (move.y && m.choice !== doorsKind) m.lane = clamp(m.lane + move.y * 22, -22, 22);
+        if (move.y && !fullRoadTrap(m.choice)) m.lane = sideTrap(m.choice) ? move.y * 22 : clamp(m.lane + move.y * 22, -22, 22);
         if (tap(prefix + '2')) { m.workshopMode = 'choice'; clearInput(); }
         else if (this.confirm(owner) && m.place()) { m.startDraft(); clearInput(); }
       }
@@ -922,6 +1107,6 @@ function bootCabinet() {
   new Phaser.Game({ type: Phaser.AUTO, width: 800, height: 600, parent: 'game-root', backgroundColor: '#0e1018', audio: { noAudio: true }, scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH }, scene: CabinetScene });
 }
 /* Original Scrapline font, subset and conventionally WOFF-compressed. */
-const cabinetMusic = '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';
+const cabinetSamples = ['LkVicnNwb29xd3hpUTkoK1OX1PDx49LM09K2hVc4LDdTbHNwbm1tcXdxXEMtJDdvtOLw6djLzdTHn25HMjFGY3R1cXBwcXh5a1I6KCpPks/u8OLRyc/PtYZYOS03U2x1cW9vb3J4cl5ELyQ2bLDh8OrZy8zTyKJxSTMxRGFzdXFwcHF3eW1VPCopS4zK6+/i0cjO0LeJWzstNlBqdHNxcHBzeHRiSjMnNWis3vDr2svK0sikc0oy', 'PEBESU1TWWBnbnV7goeMkZaboKWprK6uraupqKempaOgnJiUkY+Ojo6OjYuKiIiKjI+Rk5OSkI+OkJKVl5iYlZKOi4qKi42NjYuIhYOCg4aKkJado6mvtbvCyc/V2dze3tzZ1tHNyMO+uLKrpJ2VjYV9dWxjW1JKQTkyKiQeGRUSERAREhMVFhgaHSAjJysvMzY6PkFGS1FXXmVscnh+g4iOlJmfo6epqamoqKenp6akoZ2YlZKQj4+PjoyLiYmKjI+Rk5SUk5GQkJKUl5mZl5WRjoyMjI6Pj46MiYaDgoOGio+Ump+lqrC3vcTL0dXZ2trY1tPPy8bBvLexqqSdlo+HgHhwZ19WTUQ8NCwlHhkUERAPDxAREhQWGRwfIycrLzI2Oj5CR0xTWWFob3V7gIaLkZedoqapqqurqqqqqqqopqKfm5eVlJOTkpGPjYuLjI6Qk5SVlJKRkZKTlpiZmZeUkY+NjI2Ojo2MiYaDgYCBg4aLj5SZn6Sqsbi/xszR1dfX1tXSzsrGwby2saqknZaPiIB4cGhfV05GPjYuJyEbFxQSERESExUXGRseISUpLDA0OA=='];
 const displayFont = new FontFace('Scrapline', 'url(data:font/woff;base64,d09GRk9UVE8AAAtEAAkAAAAAE2gAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAABDRkYgAAAA6AAACGgAAA+xgSbo\x2fU9TLzIAAAoQAAAARQAAAGBpzGX2Y21hcAAACuQAAABRAAAAZgGpAh1oZWFkAAAJUAAAADYAAAA2MdoGIGhoZWEAAAn0AAAAGwAAACQDQAUWaG10eAAACYgAAABpAAAAtJjIAABtYXhwAAAA4AAAAAYAAAAGAC1QAG5hbWUAAApYAAAAigAAARYUOS6icG9zdAAACzgAAAAMAAAAIAADAAAAAFAAAC0AAHicvVd7cFRXGd9N9kd4hIVUboYysbZxasGGCC0FrE4KVpzSwVIqwSoIpQ01FApJCE1Dskn2kX3k7Oa1Cck2IA9pEUsjRex06BQLUyeISk2nMmKt044DKuM0ODI95+45i37nbngkd0H+cjLJ4Z57zvf4fd\x2fv912cDleWw+l05n3nmaq1FRvXb1r3xLofbt24tkpv3iWKHGJmlijOFlNdTC403y\x2fAK+CFk1jBpNdv40V5jilOZ1a2C2Nyxo4bPyF3onvS5LzbPl88b9bs++6f88DcefO\x2fWvzgXQ\x2fNvPcrK9ZVbVm\x2fedOds4pnX3V057CnqxsOh5N+HIW3O0OTHTMpLIfLkeNY5ix0Pu\x2f8R9acrIqss9n52fdn92V\x2f5BrnWu7qghNtYyaN+VnOwpznc06M\x2fdzYX4z9aFz+uMXj\x2fjU+f3z1+E8mTJ3QlpuTe2+umlgzMTLxpxNPuyvcfvd+91vin24x2Z3s38gMsc10YJBhdwSJEOJ+RJsQ9KCxFoxBfVsNQKwxHYZYl3JAvkFb6+j8bDXfMKczsHuQosWdrGLMYPTCfJ9hXxi7\x2fEh4EK9BaxWYqka4Cv4aeDyo8aMqjMtjyeJxur4SZpPaaCRi6GlDPI62HsQSYEOIJBDqgT+OxjZ4YlAVDJ4IGkPw+xFqRMSjXcc8aGvUIfeEkIhAPM0P2kwN2Ew9bTe1dLQpd3J10kUxpr7PIEtkCSUxWedCGVFelB3laB5jOlJ1iWmzZJxckCNyx\x2fhe8CyeBdGvsam\x2fgs1JhldDeNmLnbXorkTbBjK7BKEN8FaithaVXmwIIXX5GjZPEjbnzpG9N2xZbLNnIf9uT2Nu6VVrTP3eCoPX06MuZj29Mv+cLqJe5JcNc3v6US+y5Pq37mTh\x2fzJ1Mn1YL3KOYfrSjz6rPZJTNZqbboImNQ7jO6FWWNc4HWUbEGlEyAd\x2fQCfqaYEUN8H6hHYUvHGQYhUb8Zz6phhj0KZ2p2hx8zM3vuw2feZ0esvU0dHNrA4x1Mbg6YC3G80JRHZSUHPAXXRz0eiK8CaG0S0qqlHKhv0SVDcOwizTIG5XE\x2fC9IYiTfD9Uk1xkmH9SS6ECRM0V3EuRJm9WqCHD3J0uDC3uAtdnGQ670oc\x2f0bSfor4APijoz0vkYCBVitQ3zFIkd6ccIwHKCP2wpb\x2fp9ligHkexLMTlAvEXJGdcue+6cn\x2ffIDOqWlEThycB\x2fy6E9xE0S9LF1X1pk5UlkFkyCw8PGYODBPkpG0cIkkWLqBlPZaD3FU4esxuWAVuJzzBrWx6+xs2Nsv4WdGvVLejW\x2fzV1\x2fiF\x2fksRc5UFSA8hf8dj16n0yAxrfRaQGgXo0NaE+gJoI1JBG450RaLwgF9jQ+LktqmftaDxjU\x2fEnvAbfrKZB\x2foji2yym6WqZWhRT+xhmz9bChFgtOjzo9iLRjJ0Ri\x2ft0tceaX2QsptUwX9snL+RLqwfF\x2fanV+CaZsUR1r6YqEZZoS+QlCqsTdnk5oFOhhCgtSo5SFJ9qnXFf1+xvGeaRNKVo4YfUDoOJHWliqB2aGGxYOEZL3tfpeAknORQrIDUPVHG6rqrEHgiphDx8TSb28fWantPUESSq0fEiIlaFXmxGRURPbrmc6LqMaprsZ4Yar\x2f4IXyO8XjT60dAMTxh1LfrYXAbxRTrlLkCUryKLfJc6qIdT6wsI1qGhETWBKxYfpN9f01kxS71r8GPiOXxMsLegO4SOIKJ+RLwINFhHf6M84OfF6wbBsRY9W9Beg1CdFWAAm9PmvkW\x2fPWIezE7+A0MeUR8jSPf98DfDG4I3jCYrwvsIpHd1hMmXeLs1Zkgt1BRGg0Znd44ZKb0jH2PUvta5II\x2frRHrkcsg75GNQceFG8jzB8Kh8D4vPgf+Wb4VcQ\x2fOOqedIEwlSSkaLAt1LutIT4bSaD3Ha+vdllzXpxWkxn\x2fYZSoeuqXUm5q7EhQswt2Tg7UoUFaFkyBgYoP77IJNaLF1KrfuBjRR3838bapm6E9t\x2fBx\x2fNmD609qE7gUQX+mLoC0Pki1w0LkaXB7E6hOvg9cDjQ10Eda1wi6O9Yj0Vg+bS8RmQhyTNpwdUzigFf\x2fSAxjeaQQPy0dKEsBfNPl0hbzPULvkTiKPptr9owXOAWuk9fhzdHeiMo6MLrd2Ibgc7A3VBU2aBZd13K9+H+qNBA\x2f42Q28UXe3o7ER7F6K9hFoe1PL0W73QY0svgl0IdMLXjoYo1NvWB4f4JXlT06iIsogCu12X7ktqjGGeT8dMi3hKd8AIBBboDrA+7O4ZFv08K8sfWyH3Nlghb6HtblvI0XRQAxlDHh3jh9RE\x2fOzVLlqdqYuW4dIliM1WLFJDLHMhiHF7IuijvqDuqENsK21vGzEMLticPZyeBUWINqDdh84AuoLobdEFt9K9eLWK5l4iyUoSLUmDQKwUOyxS8L8ajD+iozHXZHBPVFowaIxO+k1bGKRpDS3wBREIIOhDCynF6tEhySo1w9gaQx1RgojRh8gewu8sLFLKgygs1OyxZl6WzcGzdgfybnvSq2msVhhSz1bGtyG2B\x2fE+9PSgL449MZj0xc81nEx1IpX+xBe6E85o0gV74etCQzvqYqi6Ed4Z4ijC4CL6wHwnGDR4hW7bCsgKlmGHnRl14BRvpRp9TQGyII5ynkJY\x2fcfgZfpMGSStbnPTm3oUPM7QH8bhBvRX4uVy9JahtRzsKYTL0VCGynKUV6KsAeVhPMTga0E0is42XbFYB1gIoWX0bd6NttPoeA19h7D\x2fVfTvxqHteK0Vf2CIRxGKaG1uJp0PIRoHewUtccRI\x2fP2IN6ON3lLyjxB8C1XpyAhJR\x2flFQ1TrIuZAVeutz6ytHcNbtPI19D8OLZ48h1lS6Tbv8NTQiDOng1NV1LTUdLj\x2fC\x2fklmPUAAQAAAAEAAEkLqj5fDzz1AAMD6AAAAADnB+E7AAAAAOcH4Tv\x2fZ\x2f9TBUwDdwAAAAMAAgAAAAAAAHicY4pgYGCsYWBgkWJgYL4HxKeA+AUQLwLiPqjYJ6AaJwYGpndQfhpQ\x2fTeIOIsARA+YhumvQsix9gBpNggfLAdUw6QGpLcB8RqonjVQuW1QGogZdaDYDKj+FhBbAXESEHcxMAAAEkIbRwAAAHicY2BkYGC2++\x2fEwMC6jAECGBlQgS4APnsCXQB4nGNgZuZm\x2fMLAysDA1MW0m4GBoQdCM95nMGRkYkAFjMicCCBgcGBQYIhitvvvxMDAXM6wFqaG8RpTDlBGgYEBADaNC4gAAAB4nIWOPQ6CQBCFP36U0FgYYr3xAARbSg9AIYmFHQFCSAga1Ct4Cg\x2fri7sVIaF4M9+bmX1ZIOJGgBfGgC9Z9tjLWfbZkTgOOHN0HIoaxxsOfBxvMXylkpqJigcDPSMtF6njLV9pU2j6Ur\x2frtlAdeWpva7743swS1i+ucpMS+3++ISPltPazH\x2famJvgAAHicRYw7CoAwAENfqaNDj6CLiB901UW8Rm\x2frdUTPEEMXE0LgQQIEogM1Fdmd7OhuGVnY2DnIkkljMrMWchZi6dGrW5c\x2fUln\x2fCvQMdEwfqgsPvgAAAHicY2BmwAsAAH0ABA==)');
 displayFont.load().then(font => { document.fonts.add(font); bootCabinet(); }).catch(bootCabinet);
